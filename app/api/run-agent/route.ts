@@ -1,0 +1,50 @@
+import { NextRequest, NextResponse } from "next/server";
+import { runCustomerSuccessAudit } from "@/lib/agent";
+import { extractCSUser } from "@/lib/firebase-admin";
+
+export const dynamic = "force-dynamic";
+export const maxDuration = 60; // Permite tempo hábil para o loop de raciocínio da IA
+
+/**
+ * POST /api/run-agent
+ * Dispara a execução sob demanda da auditoria preventiva do Agente de CS
+ * Isola a auditoria na carteira do analista de CS autenticado (token/headers/body)
+ */
+export async function POST(request: NextRequest) {
+  try {
+    let bodyData: any = null;
+    try {
+      bodyData = await request.json();
+    } catch {
+      // Body vazio ou não JSON
+    }
+
+    const csUser = await extractCSUser(request, bodyData);
+
+    console.log(
+      `🤖 [/api/run-agent] Disparo de auditoria solicitado via API${
+        csUser ? ` para CS: ${csUser.name || csUser.email || csUser.uid}` : " (Geral)"
+      }...`
+    );
+
+    const auditResult = await runCustomerSuccessAudit(csUser || undefined);
+
+    return NextResponse.json({
+      success: true,
+      message: csUser
+        ? `Auditoria de Customer Success executada para a carteira de ${csUser.name || csUser.email}.`
+        : "Auditoria de Customer Success executada com sucesso.",
+      csUser: csUser || null,
+      data: auditResult,
+    });
+  } catch (error: any) {
+    console.error("❌ [/api/run-agent] Erro durante auditoria:", error);
+    return NextResponse.json(
+      {
+        success: false,
+        error: error.message || "Erro desconhecido durante execução do agente.",
+      },
+      { status: 500 }
+    );
+  }
+}
