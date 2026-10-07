@@ -6,20 +6,36 @@ import path from "path";
 import { NextRequest } from "next/server";
 
 let firebaseApp: App;
-const serviceAccountPath = path.resolve(process.cwd(), "firebase-service-account.json");
 
-if (!getApps().length) {
-  if (!fs.existsSync(serviceAccountPath)) {
-    console.error(`❌ [Firebase Admin] Credenciais não encontradas em: ${serviceAccountPath}`);
-    throw new Error(`Arquivo firebase-service-account.json ausente em: ${serviceAccountPath}`);
+function getServiceAccount() {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+    try {
+      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+    } catch (err) {
+      console.error("❌ Falha ao fazer parse de FIREBASE_SERVICE_ACCOUNT_KEY:", err);
+    }
   }
 
-  const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, "utf-8"));
+  // Fallback local caso o arquivo exista em ambiente de desenvolvimento
+  const localPath = path.resolve(process.cwd(), "firebase-service-account.json");
+  if (fs.existsSync(localPath)) {
+    return JSON.parse(fs.readFileSync(localPath, "utf8"));
+  }
+
+  throw new Error(
+    "Nenhuma credencial do Firebase Admin encontrada (FIREBASE_SERVICE_ACCOUNT_KEY ou arquivo local)."
+  );
+}
+
+if (!getApps().length) {
+  const serviceAccount = getServiceAccount();
   firebaseApp = initializeApp({
     credential: cert(serviceAccount),
     projectId: serviceAccount.project_id,
   });
-  console.log(`🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${serviceAccount.project_id}"`);
+  console.log(
+    `🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${serviceAccount.project_id}"`
+  );
 } else {
   firebaseApp = getApps()[0];
 }
