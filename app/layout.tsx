@@ -2,9 +2,14 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Kenit | CS Sentinel - Observability & CS Cockpit",
+  title: "Kenit CS Sentinel | Observability & Cockpit",
   description:
-    "Cockpit inteligente de observabilidade e retenção preventiva de clientes com IA autônoma, MongoDB e Firestore.",
+    "Plataforma operacional e cockpit de observabilidade preventiva para Customer Success - Kenit.",
+  icons: {
+    icon: "/logo-kenit.png",
+    shortcut: "/logo-kenit.png",
+    apple: "/logo-kenit.png",
+  },
 };
 
 export default function RootLayout({
@@ -15,9 +20,7 @@ export default function RootLayout({
   return (
     <html lang="pt-BR">
       <body className="bg-[#F8FAFC] text-slate-900 antialiased selection:bg-[#1D00EB] selection:text-white">
-        <div className="min-h-screen flex flex-col">
-          {children}
-        </div>
+        <div className="min-h-screen flex flex-col">{children}</div>
       </body>
     </html>
   );
