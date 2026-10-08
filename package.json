@@ -43,5 +43,10 @@
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.6.3"
+  },
+  "overrides": {
+    "jwks-rsa": {
+      "jose": "^4.15.5"
+    }
   }
 }
