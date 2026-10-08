@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { runCustomerSuccessAudit } from "@/lib/agent";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 300; // 5 minutos de timeout para execução do loop de IA
+export const maxDuration = 60; // Permite até 60s de execução na Vercel
 
 /**
  * GET /api/cron/audit
@@ -31,6 +31,20 @@ export async function GET(request: NextRequest) {
           error: "Não autorizado. Forneça o header 'Authorization: Bearer <CRON_SECRET>' válido.",
         },
         { status: 401 }
+      );
+    }
+
+    // Validação antecipada da chave do Gemini
+    const apiKey =
+      process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "Chave GEMINI_API_KEY não configurada nas variáveis de ambiente da Vercel.",
+        },
+        { status: 400 }
       );
     }
 

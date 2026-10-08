@@ -31,7 +31,7 @@ ChatSession.prototype.sendMessage = async function (request: any, requestOptions
   return result;
 };
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const CS_WEBHOOK_URL = process.env.CS_WEBHOOK_URL || null;
 
@@ -280,15 +280,29 @@ export async function runCustomerSuccessAudit(
   const analystContext = csFilter?.name
     ? ` para a carteira do analista de CS ${csFilter.name} (${csFilter.email || csFilter.uid || ""})`
     : "";
-  log(`🚀 Iniciando Auditoria Preventiva de CS${analystContext}. Modelo: ${GEMINI_MODEL}`);
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    GEMINI_API_KEY;
 
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY não configurada no ambiente.");
+  if (!apiKey) {
+    throw new Error(
+      "Chave GEMINI_API_KEY não configurada nas variáveis de ambiente da Vercel."
+    );
   }
 
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  // Garante que o modelo utilizado seja estável e rápido (gemini-3.5-flash-lite ou o configurado em GEMINI_MODEL)
+  let modelName = (process.env.GEMINI_MODEL || GEMINI_MODEL || "gemini-3.5-flash-lite").trim();
+  if (!modelName || modelName === "gemini-2.5-flash") {
+    // Caso gemini-2.5-flash esteja depreciado para novas contas na API do Google Studio, utiliza gemini-3.5-flash-lite
+    modelName = "gemini-3.5-flash-lite";
+  }
+
+  log(`🚀 Iniciando Auditoria Preventiva de CS${analystContext}. Modelo: ${modelName}`);
+
+  const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
-    model: GEMINI_MODEL,
+    model: modelName,
     systemInstruction: SYSTEM_INSTRUCTION,
     tools: toolsDeclarations,
   });
@@ -340,18 +354,36 @@ export async function runCustomerSuccessAudit(
           );
         } else if (name === "checkTenantHealth") {
           const { entidadeId, diasSemAcesso, tiposMonitorados } = args as any;
-          toolResult = await checkTenantHealthMetrics(entidadeId, diasSemAcesso, tiposMonitorados);
-          log(`   📊 Telemetria processada para ${toolResult.nomeEntidade || entidadeId}`);
+          const rawHealth = (await checkTenantHealthMetrics(entidadeId, diasSemAcesso, tiposMonitorados)) as any;
+          log(`   📊 Telemetria processada para ${rawHealth.nomeEntidade || entidadeId}`);
 
           // Avalia se métricas estão em patamar saudável
           const tenantConfig = loadedTenants.find((t) => t.entidadeId === entidadeId);
           const maxErros = tenantConfig?.thresholds.maxErros2h ?? 5;
-          const errosRecentes = toolResult.errosRecentesUltimas2h ?? 0;
-          const usuariosAtivos = toolResult.usuariosAtivosNoPeriodo ?? 0;
+          const errosRecentes = rawHealth.errosRecentesUltimas2h ?? 0;
+          const usuariosAtivos = rawHealth.usuariosAtivosNoPeriodo ?? 0;
 
           if (errosRecentes <= maxErros && usuariosAtivos > 0) {
             tenantsAuditedHealthy.add(entidadeId);
           }
+
+          // Envia resumo estruturado e enxuto para a IA não estourar tokens/tempo
+          toolResult = {
+            entidadeId: rawHealth.entidadeId || entidadeId,
+            nomeEntidade: rawHealth.nomeEntidade,
+            totalUsuariosCadastrados: rawHealth.totalUsuariosCadastrados,
+            usuariosAtivosNoPeriodo: rawHealth.usuariosAtivosNoPeriodo,
+            totalUsuariosInativos: rawHealth.totalUsuariosInativos,
+            errosRecentesUltimas2h: rawHealth.errosRecentesUltimas2h,
+            resumoErrosPorCanal: (rawHealth.gruposErros || []).map((g: any) => ({
+              canal: g.layoutIntegracao,
+              tipo: g.tipoIntegracao,
+              totalErros: g.totalErros,
+              amostraMensagens: g.amostraMensagens?.slice(0, 2) || [],
+            })),
+            amostraMensagens: (rawHealth.amostraErros || []).slice(0, 3),
+            periodoDiasAnalise: rawHealth.periodoDiasAnalise,
+          };
         } else if (name === "sendCSAlert") {
           const {
             entidadeId: argEntidadeId,
@@ -508,7 +540,7 @@ export async function runCustomerSuccessAudit(
   return {
     success: true,
     timestamp: new Date().toISOString(),
-    model: GEMINI_MODEL,
+    model: modelName,
     totalEntitiesAudited: auditedEntitiesCount,
     totalAlertsDispatched: dispatchedAlerts.length,
     alertsDispatched: dispatchedAlerts,

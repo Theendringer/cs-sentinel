@@ -178,7 +178,7 @@ export async function checkTenantHealthMetrics(
       .collection("errosintegracoes")
       .find(errorQuery, { projection })
       .sort({ dataCriacao: -1, ultimaAtualizacao: -1 })
-      .limit(300)
+      .limit(50)
       .toArray();
 
     let totalErros2h = errosDocs.length;

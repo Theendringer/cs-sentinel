@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { runCustomerSuccessAudit } from "@/lib/agent";
 import { extractCSUser } from "@/lib/firebase-admin";
 
+export const maxDuration = 60; // Permite até 60s de execução na Vercel
 export const dynamic = "force-dynamic";
-export const maxDuration = 60; // Permite tempo hábil para o loop de raciocínio da IA
 
 /**
  * POST /api/run-agent
@@ -12,6 +12,19 @@ export const maxDuration = 60; // Permite tempo hábil para o loop de raciocíni
  */
 export async function POST(request: NextRequest) {
   try {
+    // 1. Validação antecipada da chave do Gemini
+    const apiKey =
+      process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        {
+          error:
+            "Chave GEMINI_API_KEY não configurada nas variáveis de ambiente da Vercel.",
+        },
+        { status: 400 }
+      );
+    }
+
     let bodyData: any = null;
     try {
       bodyData = await request.json();
@@ -38,11 +51,11 @@ export async function POST(request: NextRequest) {
       data: auditResult,
     });
   } catch (error: any) {
-    console.error("❌ [/api/run-agent] Erro durante auditoria:", error);
+    console.error("[ERRO AGENTE IA]:", error);
     return NextResponse.json(
       {
-        success: false,
-        error: error.message || "Erro desconhecido durante execução do agente.",
+        error: error?.message || "Falha ao processar análise da IA",
+        details: error?.response?.data || error?.toString(),
       },
       { status: 500 }
     );

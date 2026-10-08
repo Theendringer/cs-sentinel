@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getMongoDb, ObjectId } from "@/lib/mongodb";
 import { getAdminFirestore, extractCSUser } from "@/lib/firebase-admin";
 
+export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
 /**
