@@ -109,13 +109,15 @@ export async function GET(
 
       // Busca primeiro pelo documento isolado do analista: ${csUser.uid}_${id}
       let docSnap: any = null;
-      if (csUser?.uid) {
-        docSnap = await firestoreDb.collection("monitored_tenants").doc(`${csUser.uid}_${id}`).get();
-      }
+      if (firestoreDb) {
+        if (csUser?.uid) {
+          docSnap = await firestoreDb.collection("monitored_tenants").doc(`${csUser.uid}_${id}`).get();
+        }
 
-      // Se não encontrou, busca pelo docId tradicional ou por query
-      if (!docSnap || !docSnap.exists) {
-        docSnap = await firestoreDb.collection("monitored_tenants").doc(id).get();
+        // Se não encontrou, busca pelo docId tradicional ou por query
+        if (!docSnap || !docSnap.exists) {
+          docSnap = await firestoreDb.collection("monitored_tenants").doc(id).get();
+        }
       }
 
       if (docSnap && docSnap.exists) {

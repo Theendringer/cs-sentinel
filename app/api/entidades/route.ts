@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getMongoDb } from "@/lib/mongodb";
-import { firestore, extractCSUser } from "@/lib/firebase-admin";
+import { getAdminFirestore, extractCSUser } from "@/lib/firebase-admin";
 
 export const dynamic = "force-dynamic";
 
@@ -8,8 +8,8 @@ export const dynamic = "force-dynamic";
  * GET /api/entidades
  * - Consulta todas as empresas no MongoDB (READ-ONLY).
  * - Busca no Firestore a carteira filtrando estritamente por assignedCS.uid == user.uid (ou email).
- * - Retorna isMonitored: true e active: true apenas para as empresas que o analista logado escolheu monitorar.
- * - Totalmente resiliente: falhas no Firestore não derrubam a listagem de entidades do MongoDB.
+ * - Se Firestore for null ou falhar, devolve a lista das entidades com isMonitored: false e status 200 em formato JSON.
+ * - Totalmente resiliente para Serverless na Vercel.
  */
 export async function GET(request: NextRequest) {
   try {
@@ -34,44 +34,57 @@ export async function GET(request: NextRequest) {
       console.log(`🍃 [MongoDB] ${entidades.length} entidade(s) encontrada(s) no banco.`);
     } catch (mongoErr: any) {
       console.error("❌ [MongoDB Error]:", mongoErr);
-      throw new Error(`Falha ao conectar ou buscar entidades no MongoDB: ${mongoErr.message || mongoErr}`);
+      return NextResponse.json(
+        { 
+          success: false,
+          error: "Falha ao conectar ou buscar entidades no MongoDB: " + (mongoErr.message || mongoErr),
+          detail: String(mongoErr),
+          entidades: [],
+        },
+        { status: 500 }
+      );
     }
 
-    // 2. Busca registros no Firestore na collection 'monitored_tenants' (isolado)
+    // 2. Busca registros no Firestore na collection 'monitored_tenants' via getAdminFirestore() (isolado)
     const monitoredMap = new Map<string, any>();
     try {
-      const snapshot = await firestore.collection("monitored_tenants").get();
+      const firestoreDb = getAdminFirestore();
+      if (firestoreDb) {
+        const snapshot = await firestoreDb.collection("monitored_tenants").get();
 
-      snapshot.forEach((doc: any) => {
-        const data = doc.data();
-        const tenantCsUid = data.assignedCS?.uid;
-        const tenantCsEmail = data.assignedCS?.email?.toLowerCase();
+        snapshot.forEach((doc: any) => {
+          const data = doc.data();
+          const tenantCsUid = data.assignedCS?.uid;
+          const tenantCsEmail = data.assignedCS?.email?.toLowerCase();
 
-        // Se o analista estiver identificado, filtra estritamente por ele
-        if (csUser) {
-          const matchesUid = csUser.uid && tenantCsUid && tenantCsUid === csUser.uid;
-          const matchesEmail =
-            csUser.email &&
-            tenantCsEmail &&
-            tenantCsEmail === csUser.email.toLowerCase();
+          // Se o analista estiver identificado, filtra estritamente por ele
+          if (csUser) {
+            const matchesUid = csUser.uid && tenantCsUid && tenantCsUid === csUser.uid;
+            const matchesEmail =
+              csUser.email &&
+              tenantCsEmail &&
+              tenantCsEmail === csUser.email.toLowerCase();
 
-          if (!matchesUid && !matchesEmail) {
-            return;
+            if (!matchesUid && !matchesEmail) {
+              return;
+            }
           }
-        }
 
-        const rawEntidadeId = data.entidadeId || doc.id;
-        const cleanEntidadeId =
-          rawEntidadeId.includes("_") && doc.id.length > 24
-            ? rawEntidadeId.split("_").pop() || rawEntidadeId
-            : rawEntidadeId;
+          const rawEntidadeId = data.entidadeId || doc.id;
+          const cleanEntidadeId =
+            rawEntidadeId.includes("_") && doc.id.length > 24
+              ? rawEntidadeId.split("_").pop() || rawEntidadeId
+              : rawEntidadeId;
 
-        monitoredMap.set(String(cleanEntidadeId), data);
-      });
+          monitoredMap.set(String(cleanEntidadeId), data);
+        });
 
-      console.log(
-        `🔥 [Firestore] ${monitoredMap.size} entidade(s) monitorada(s) encontrada(s) na carteira deste analista.`
-      );
+        console.log(
+          `🔥 [Firestore] ${monitoredMap.size} entidade(s) monitorada(s) encontrada(s) na carteira deste analista.`
+        );
+      } else {
+        console.warn("⚠️ [Firestore] getAdminFirestore() retornou null. Prosseguindo com isMonitored: false.");
+      }
     } catch (fsErr: any) {
       console.warn(
         `⚠️ [Firestore Warning] Falha ao ler 'monitored_tenants' (${fsErr.message}). Retornando entidades do Mongo com isMonitored: false.`
@@ -118,13 +131,15 @@ export async function GET(request: NextRequest) {
       total: resultado.length,
       cs: csUser,
       entidades: resultado,
-    });
+    }, { status: 200 });
   } catch (error: any) {
     console.error('[API /api/entidades crash]:', error);
     return NextResponse.json(
       { 
+        success: false,
         error: error.message || 'Erro interno no servidor',
-        detail: String(error)
+        detail: String(error),
+        entidades: [],
       },
       { status: 500 }
     );

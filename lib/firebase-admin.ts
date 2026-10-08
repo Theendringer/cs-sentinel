@@ -5,137 +5,136 @@ import fs from "fs";
 import path from "path";
 import { NextRequest } from "next/server";
 
-let firebaseApp: App | null = null;
-let firestoreInstance: Firestore | null = null;
-let adminAuthInstance: Auth | null = null;
-
-/**
- * Normaliza e faz o parse da credencial do Firebase Admin de forma defensiva.
- * Tolera aspas extras, quebras de linha escapadas e base64.
- */
-function parseServiceAccount(raw: string): any {
-  let cleaned = raw.trim();
-  if (
-    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
-    (cleaned.startsWith("'") && cleaned.endsWith("'"))
-  ) {
-    cleaned = cleaned.slice(1, -1).trim();
-  }
-  if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) {
+function getCredentials() {
+  const envKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+  if (envKey) {
     try {
-      const decoded = Buffer.from(cleaned, "base64").toString("utf8");
-      if (decoded.trim().startsWith("{")) {
-        cleaned = decoded.trim();
+      // Tenta decodificar se for Base64, senão parse direto de string JSON
+      let cleaned = envKey.trim();
+      if (
+        (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+        (cleaned.startsWith("'") && cleaned.endsWith("'"))
+      ) {
+        cleaned = cleaned.slice(1, -1).trim();
       }
-    } catch {}
-  }
-  const parsed = JSON.parse(cleaned);
-  if (parsed.private_key && typeof parsed.private_key === "string") {
-    parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
-  }
-  return parsed;
-}
 
-function getServiceAccount(): any | null {
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
-    try {
-      return parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+      const jsonStr = cleaned.startsWith("{")
+        ? cleaned
+        : Buffer.from(cleaned, "base64").toString("utf8");
+
+      const parsed = JSON.parse(jsonStr);
+      // Garante que private_key mantenha os escapes de quebra de linha corretos
+      if (parsed.private_key && typeof parsed.private_key === "string") {
+        parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+      }
+      return parsed;
     } catch (err: any) {
-      console.error("[Firebase Init Error]:", err.message || String(err));
+      console.error(
+        "[Firebase Admin] Erro crítico ao processar FIREBASE_SERVICE_ACCOUNT_KEY:",
+        err.message
+      );
     }
   }
 
-  // Fallback local seguro (apenas se o arquivo físico existir)
+  // Fallback para desenvolvimento local APENAS se o arquivo existir fisicamente
   try {
     const localPath = path.resolve(process.cwd(), "firebase-service-account.json");
     if (fs.existsSync(localPath)) {
-      const content = fs.readFileSync(localPath, "utf8");
-      return parseServiceAccount(content);
+      return JSON.parse(fs.readFileSync(localPath, "utf8"));
     }
-  } catch (fsErr: any) {
-    console.error("[Firebase Init Error]: Falha ao ler arquivo local:", fsErr.message || String(fsErr));
+  } catch (e) {
+    // ignora se não existir
   }
 
   return null;
 }
 
-// Inicialização defensiva do Firebase Admin
-try {
-  if (!getApps().length) {
-    const serviceAccount = getServiceAccount();
-    if (serviceAccount && (serviceAccount.project_id || serviceAccount.projectId)) {
-      const projId = serviceAccount.project_id || serviceAccount.projectId;
-      firebaseApp = initializeApp({
-        credential: cert(serviceAccount),
-        projectId: projId,
-      });
-      console.log(
-        `🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${projId}"`
-      );
-    } else {
-      console.error(
-        "[Firebase Init Error]: Nenhuma credencial válida do Firebase Admin encontrada (FIREBASE_SERVICE_ACCOUNT_KEY ausente ou malformada e arquivo local inexistente)."
-      );
+/**
+ * Retorna a instância do Firestore ou null se não houver credenciais.
+ * Inicializa de forma 100% lazy e segura para Serverless na Vercel.
+ */
+export function getAdminFirestore(): Firestore | null {
+  try {
+    if (!getApps().length) {
+      const creds = getCredentials();
+      if (creds && (creds.project_id || creds.projectId)) {
+        initializeApp({
+          credential: cert(creds),
+          projectId: creds.project_id || creds.projectId,
+        });
+        console.log(
+          `🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${
+            creds.project_id || creds.projectId
+          }"`
+        );
+      } else {
+        console.warn(
+          "[Firebase Admin] Nenhuma credencial encontrada. Operações com Firestore serão ignoradas."
+        );
+        return null;
+      }
     }
-  } else {
-    firebaseApp = getApps()[0];
-  }
-
-  if (firebaseApp) {
+    return getFirestore("(default)");
+  } catch (err: any) {
+    console.error("[Firebase Admin] Erro ao obter Firestore:", err.message);
     try {
-      firestoreInstance = getFirestore("(default)");
+      return getFirestore();
     } catch {
-      firestoreInstance = getFirestore();
+      return null;
     }
-    adminAuthInstance = getAuth(firebaseApp);
   }
-} catch (err: any) {
-  console.error("[Firebase Init Error]:", err.message || String(err));
 }
 
-// Proxy seguro para o Firestore: não quebra a carga do módulo se o Firebase não estiver inicializado
+/**
+ * Retorna a instância do Auth ou null se não houver credenciais.
+ */
+export function getAdminAuth(): Auth | null {
+  try {
+    if (!getApps().length) {
+      const creds = getCredentials();
+      if (creds && (creds.project_id || creds.projectId)) {
+        initializeApp({
+          credential: cert(creds),
+          projectId: creds.project_id || creds.projectId,
+        });
+      } else {
+        return null;
+      }
+    }
+    const app = getApps()[0];
+    return app ? getAuth(app) : null;
+  } catch (err: any) {
+    console.warn("[Firebase Admin Auth]: Não inicializado:", err.message);
+    return null;
+  }
+}
+
+// Proxies retrocompatíveis para evitar quebras em imports legados
 export const firestore: Firestore = new Proxy({} as Firestore, {
   get(target, prop, receiver) {
-    if (firestoreInstance) {
-      const val = Reflect.get(firestoreInstance, prop, receiver);
-      return typeof val === "function" ? val.bind(firestoreInstance) : val;
+    const db = getAdminFirestore();
+    if (!db) {
+      throw new Error(
+        "[Firebase Admin] Firestore indisponível. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
+      );
     }
-    if (getApps().length > 0) {
-      try {
-        firestoreInstance = getFirestore("(default)");
-        const val = Reflect.get(firestoreInstance, prop, receiver);
-        return typeof val === "function" ? val.bind(firestoreInstance) : val;
-      } catch {}
-    }
-    throw new Error(
-      "Firebase Admin / Firestore não está inicializado. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
-    );
+    const val = Reflect.get(db, prop, receiver);
+    return typeof val === "function" ? val.bind(db) : val;
   },
 });
 
-// Proxy seguro para Auth
 export const adminAuth: Auth = new Proxy({} as Auth, {
   get(target, prop, receiver) {
-    if (adminAuthInstance) {
-      const val = Reflect.get(adminAuthInstance, prop, receiver);
-      return typeof val === "function" ? val.bind(adminAuthInstance) : val;
+    const auth = getAdminAuth();
+    if (!auth) {
+      throw new Error(
+        "[Firebase Admin] Auth indisponível. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
+      );
     }
-    if (getApps().length > 0) {
-      try {
-        adminAuthInstance = getAuth(getApps()[0]);
-        const val = Reflect.get(adminAuthInstance, prop, receiver);
-        return typeof val === "function" ? val.bind(adminAuthInstance) : val;
-      } catch {}
-    }
-    throw new Error(
-      "Firebase Admin Auth não está inicializado. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
-    );
+    const val = Reflect.get(auth, prop, receiver);
+    return typeof val === "function" ? val.bind(auth) : val;
   },
 });
-
-export function getAdminFirestore(): Firestore {
-  return firestore;
-}
 
 export interface CSUserFilter {
   uid?: string;
@@ -199,17 +198,20 @@ export async function extractCSUser(
     const token = authHeader.split("Bearer ")[1].trim();
     if (token && token !== process.env.CRON_SECRET) {
       try {
-        const decoded = await adminAuth.verifyIdToken(token);
-        if (decoded && (decoded.uid || decoded.email)) {
-          return {
-            uid: decoded.uid,
-            email: decoded.email || explicitData?.csEmail || "cs@kenit.com.br",
-            name:
-              decoded.name ||
-              decoded.email?.split("@")[0] ||
-              explicitData?.csName ||
-              "Analista de CS",
-          };
+        const auth = getAdminAuth();
+        if (auth) {
+          const decoded = await auth.verifyIdToken(token);
+          if (decoded && (decoded.uid || decoded.email)) {
+            return {
+              uid: decoded.uid,
+              email: decoded.email || explicitData?.csEmail || "cs@kenit.com.br",
+              name:
+                decoded.name ||
+                decoded.email?.split("@")[0] ||
+                explicitData?.csName ||
+                "Analista de CS",
+            };
+          }
         }
       } catch {}
     }
@@ -281,9 +283,14 @@ export async function getActiveMonitoredTenants(
   csFilter?: CSUserFilter
 ): Promise<MonitoredTenant[]> {
   const monitored: MonitoredTenant[] = [];
+  const db = getAdminFirestore();
+  if (!db) {
+    console.warn("⚠️ [Firestore] getAdminFirestore() indisponível. Retornando [].");
+    return monitored;
+  }
 
   try {
-    const snapshot = await firestore
+    const snapshot = await db
       .collection("monitored_tenants")
       .where("active", "==", true)
       .get();
@@ -360,6 +367,16 @@ export async function upsertMonitoredTenants(
   firestoreSuccess: boolean;
   firestoreError?: string;
 }> {
+  const db = getAdminFirestore();
+  if (!db) {
+    return {
+      success: false,
+      count: 0,
+      firestoreSuccess: false,
+      firestoreError: "Firestore indisponível (credenciais ausentes)",
+    };
+  }
+
   let firestoreSuccess = false;
   let lastFsErrorMsg = "";
 
@@ -394,7 +411,7 @@ export async function upsertMonitoredTenants(
 
       // ID do documento com vínculo do analista: ${user.uid}_${entidadeId}
       const docId = `${csUid}_${tenant.entidadeId}`;
-      const docRef = firestore.collection("monitored_tenants").doc(docId);
+      const docRef = db.collection("monitored_tenants").doc(docId);
       await docRef.set(docData, { merge: true });
       console.log(
         `🔥 [Firestore] Documento gravado com ID '${docId}': active=${docData.active} | CS: ${csName} (${csEmail})`
@@ -446,9 +463,14 @@ export async function getAlertsHistory(
   csFilter?: CSUserFilter
 ): Promise<AlertRecord[]> {
   const alerts: AlertRecord[] = [];
+  const db = getAdminFirestore();
+  if (!db) {
+    console.warn("⚠️ [Firestore] getAdminFirestore() indisponível em getAlertsHistory. Retornando [].");
+    return alerts;
+  }
 
   try {
-    const snapshot = await firestore
+    const snapshot = await db
       .collection("cs_alerts_history")
       .limit(limitCount * 3)
       .get();
@@ -531,7 +553,13 @@ export async function saveCSAlert(
     alertData.entidadeNome.toLowerCase().replace(/[^a-z0-9]/g, "_");
   const csUid = explicitCsUid || alertData.csUid || alertData.assignedCS?.uid;
   const docId = generateAlertDocId(entidadeId, alertData.tipoRisco, csUid);
-  const docRef = firestore.collection("cs_alerts_history").doc(docId);
+  
+  const db = getAdminFirestore();
+  if (!db) {
+    console.warn("⚠️ [Firestore] getAdminFirestore() indisponível em saveCSAlert. Ignorando persistência.");
+    return docId;
+  }
+  const docRef = db.collection("cs_alerts_history").doc(docId);
 
   const now = new Date().toISOString();
   const csName = alertData.csName || alertData.assignedCS?.name || "Time de CS";
@@ -620,9 +648,11 @@ export async function resolveTenantAlerts(
   csUid?: string
 ): Promise<number> {
   if (!entidadeId) return 0;
+  const db = getAdminFirestore();
+  if (!db) return 0;
 
   try {
-    const query = firestore
+    const query = db
       .collection("cs_alerts_history")
       .where("entidadeId", "==", entidadeId)
       .where("status", "==", "ativo");
@@ -634,7 +664,7 @@ export async function resolveTenantAlerts(
     }
 
     const now = new Date().toISOString();
-    const batch = firestore.batch();
+    const batch = db.batch();
     let count = 0;
 
     snapshot.forEach((doc) => {

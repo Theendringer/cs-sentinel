@@ -257,6 +257,13 @@ export default function DashboardPage() {
         fetch(`/api/alerts?${authCtx.queryParams}`, { headers: authCtx.headers }),
       ]);
 
+      if (!resEntidades.ok) {
+        throw new Error(`Falha ao carregar entidades: HTTP ${resEntidades.status}`);
+      }
+      if (!resAlerts.ok) {
+        throw new Error(`Falha ao carregar alertas: HTTP ${resAlerts.status}`);
+      }
+
       const dataEntidades = await resEntidades.json();
       const dataAlerts = await resAlerts.json();
 
@@ -286,6 +293,9 @@ export default function DashboardPage() {
       const res = await fetch(`/api/entidades/${id}/analytics?${authCtx.queryParams}`, {
         headers: authCtx.headers,
       });
+      if (!res.ok) {
+        throw new Error(`Falha ao obter analytics da entidade: HTTP ${res.status}`);
+      }
       const data = await res.json();
 
       if (data.success) {
@@ -366,6 +376,9 @@ export default function DashboardPage() {
         headers: authCtx.headers,
         body: JSON.stringify(payload),
       });
+      if (!res.ok) {
+        throw new Error(`Falha ao salvar monitoramento: HTTP ${res.status}`);
+      }
 
       const data = await res.json();
       if (data.success) {
@@ -522,6 +535,9 @@ export default function DashboardPage() {
         headers: authCtx.headers,
         body: JSON.stringify(payload),
       });
+      if (!res.ok) {
+        throw new Error(`Falha ao salvar regras no servidor: HTTP ${res.status}`);
+      }
 
       const data = await res.json();
       if (data.success) {
@@ -568,6 +584,9 @@ export default function DashboardPage() {
           csName: authCtx.name,
         }),
       });
+      if (!res.ok) {
+        throw new Error(`Falha na requisição da auditoria: HTTP ${res.status}`);
+      }
       const data = await res.json();
 
       if (data.success && data.data) {
@@ -610,6 +629,9 @@ export default function DashboardPage() {
           entidadeNome: currentEntityName,
         }),
       });
+      if (!res.ok) {
+        throw new Error(`Falha no envio de e-mail de teste: HTTP ${res.status}`);
+      }
 
       const data = await res.json();
       if (data.success) {

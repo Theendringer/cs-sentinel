@@ -2,37 +2,32 @@ import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import { readFileSync, existsSync } from "fs";
 
-let firestoreInstance = null;
-
-function parseServiceAccount(raw) {
-  let cleaned = raw.trim();
-  if (
-    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
-    (cleaned.startsWith("'") && cleaned.endsWith("'"))
-  ) {
-    cleaned = cleaned.slice(1, -1).trim();
-  }
-  if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) {
+function getCredentials() {
+  const envKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+  if (envKey) {
     try {
-      const decoded = Buffer.from(cleaned, "base64").toString("utf8");
-      if (decoded.trim().startsWith("{")) {
-        cleaned = decoded.trim();
+      let cleaned = envKey.trim();
+      if (
+        (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+        (cleaned.startsWith("'") && cleaned.endsWith("'"))
+      ) {
+        cleaned = cleaned.slice(1, -1).trim();
       }
-    } catch {}
-  }
-  const parsed = JSON.parse(cleaned);
-  if (parsed.private_key && typeof parsed.private_key === "string") {
-    parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
-  }
-  return parsed;
-}
 
-function getServiceAccount() {
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
-    try {
-      return parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+      const jsonStr = cleaned.startsWith("{")
+        ? cleaned
+        : Buffer.from(cleaned, "base64").toString("utf8");
+
+      const parsed = JSON.parse(jsonStr);
+      if (parsed.private_key && typeof parsed.private_key === "string") {
+        parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+      }
+      return parsed;
     } catch (err) {
-      console.error("[Firebase Init Error]:", err.message || String(err));
+      console.error(
+        "[Firebase Admin] Erro crítico ao processar FIREBASE_SERVICE_ACCOUNT_KEY:",
+        err.message || String(err)
+      );
     }
   }
 
@@ -40,60 +35,58 @@ function getServiceAccount() {
   try {
     const serviceAccountUrl = new URL("./firebase-service-account.json", import.meta.url);
     if (existsSync(serviceAccountUrl)) {
-      return parseServiceAccount(readFileSync(serviceAccountUrl, "utf-8"));
+      return JSON.parse(readFileSync(serviceAccountUrl, "utf-8"));
     }
   } catch (fsErr) {
-    console.error("[Firebase Init Error]: Falha ao ler arquivo local:", fsErr.message || String(fsErr));
+    // ignora se não existir
   }
 
   return null;
 }
 
-try {
-  if (!getApps().length) {
-    const serviceAccount = getServiceAccount();
-    if (serviceAccount && (serviceAccount.project_id || serviceAccount.projectId)) {
-      const projId = serviceAccount.project_id || serviceAccount.projectId;
-      initializeApp({
-        credential: cert(serviceAccount),
-        projectId: projId,
-      });
-      console.log(`🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${projId}"`);
-    } else {
-      console.error(
-        "[Firebase Init Error]: Nenhuma credencial do Firebase Admin encontrada (FIREBASE_SERVICE_ACCOUNT_KEY ausente ou malformada e arquivo local inexistente)."
-      );
+export function getAdminFirestore() {
+  try {
+    if (!getApps().length) {
+      const creds = getCredentials();
+      if (creds && (creds.project_id || creds.projectId)) {
+        initializeApp({
+          credential: cert(creds),
+          projectId: creds.project_id || creds.projectId,
+        });
+        console.log(
+          `🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${
+            creds.project_id || creds.projectId
+          }"`
+        );
+      } else {
+        console.warn(
+          "[Firebase Admin] Nenhuma credencial encontrada. Operações com Firestore serão ignoradas."
+        );
+        return null;
+      }
     }
-  }
-
-  if (getApps().length > 0) {
+    return getFirestore("(default)");
+  } catch (err) {
+    console.error("[Firebase Admin] Erro ao obter Firestore:", err.message);
     try {
-      firestoreInstance = getFirestore("(default)");
+      return getFirestore();
     } catch {
-      firestoreInstance = getFirestore();
+      return null;
     }
   }
-} catch (err) {
-  console.error("[Firebase Init Error]:", err.message || String(err));
 }
 
 // Proxy seguro para o Firestore
 export const firestore = new Proxy({}, {
   get(target, prop, receiver) {
-    if (firestoreInstance) {
-      const val = Reflect.get(firestoreInstance, prop, receiver);
-      return typeof val === "function" ? val.bind(firestoreInstance) : val;
+    const db = getAdminFirestore();
+    if (!db) {
+      throw new Error(
+        "[Firebase Admin] Firestore indisponível. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
+      );
     }
-    if (getApps().length > 0) {
-      try {
-        firestoreInstance = getFirestore("(default)");
-        const val = Reflect.get(firestoreInstance, prop, receiver);
-        return typeof val === "function" ? val.bind(firestoreInstance) : val;
-      } catch {}
-    }
-    throw new Error(
-      "Firebase Admin / Firestore não está inicializado. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
-    );
+    const val = Reflect.get(db, prop, receiver);
+    return typeof val === "function" ? val.bind(db) : val;
   },
 });
 export const firestoreDb = firestore; // Alias retrocompatível

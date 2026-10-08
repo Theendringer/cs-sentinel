@@ -21,12 +21,12 @@ export async function GET(request: NextRequest) {
       total: tenants.length,
       cs: csUser,
       tenants,
-    });
+    }, { status: 200 });
   } catch (error: any) {
     console.error("❌ [GET /api/monitored-tenants] Erro:", error.message);
     return NextResponse.json(
-      { success: false, error: error.message },
-      { status: 500 }
+      { success: true, total: 0, tenants: [], error: error.message },
+      { status: 200 }
     );
   }
 }
