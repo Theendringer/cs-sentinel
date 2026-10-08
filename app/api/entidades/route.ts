@@ -13,17 +13,16 @@ export const dynamic = "force-dynamic";
  */
 export async function GET(request: NextRequest) {
   try {
-    let csUser = null;
-    try {
-      csUser = await extractCSUser(request);
-    } catch (authErr: any) {
-      console.warn("⚠️ [Auth CS] Falha ao extrair analista autenticado:", authErr.message);
+    const csUser = await extractCSUser(request);
+    if (!csUser || !csUser.uid || !csUser.email || csUser.uid === "cs_lead_demo") {
+      return NextResponse.json(
+        { error: "Acesso não autorizado. Faça login primeiro." },
+        { status: 401 }
+      );
     }
 
     console.log(
-      `🍃 [MongoDB READ-ONLY] Listando empresas para o CS: ${csUser?.name || "Geral"} (${
-        csUser?.email || "sem email"
-      })...`
+      `🍃 [MongoDB READ-ONLY] Listando empresas para o CS: ${csUser.name || csUser.email}...`
     );
 
     // 1. Busca todas as empresas no MongoDB (isolado em bloco próprio)

@@ -36,19 +36,6 @@ export default function LoginPage() {
     }
   };
 
-  const handleDemoAccess = () => {
-    setLoading(true);
-    try {
-      localStorage.setItem(
-        "cs_sentinel_demo_user",
-        JSON.stringify({ email: "cs.lead@kenit.com.br", name: "CS Leader Kenit" })
-      );
-    } catch {}
-    setTimeout(() => {
-      router.push("/dashboard");
-    }, 300);
-  };
-
   return (
     <div className="flex min-h-screen w-full items-center justify-center bg-[#F8FAFC] p-4 text-slate-900">
       <div className="w-full max-w-md">
@@ -129,27 +116,6 @@ export default function LoginPage() {
               )}
             </button>
           </form>
-
-          {/* Divisor */}
-          <div className="relative my-6 text-center">
-            <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-slate-200" />
-            </div>
-            <span className="relative bg-white px-3 text-[11px] font-medium uppercase tracking-wider text-slate-400">
-              Ou Acesso Rápido
-            </span>
-          </div>
-
-          {/* Botão de Demonstração / Dev */}
-          <button
-            type="button"
-            onClick={handleDemoAccess}
-            disabled={loading}
-            className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 py-2.5 text-xs font-semibold text-slate-700 transition"
-          >
-            <Lock className="h-3.5 w-3.5 text-[#1D00EB]" />
-            <span>Entrar como CS Lead (Modo Demo)</span>
-          </button>
 
           {/* Indicadores de Conexão */}
           <div className="mt-6 flex items-center justify-center gap-4 text-[11px] text-slate-400">

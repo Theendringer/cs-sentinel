@@ -218,54 +218,51 @@ export async function extractCSUser(
   }
 
   // 2. Extrai de headers customizados enviados pelo frontend (x-cs-uid, x-cs-email)
-  const headerUid = request.headers.get("x-cs-uid");
-  const headerEmail = request.headers.get("x-cs-email");
-  const headerName = request.headers.get("x-cs-name");
-  if (headerUid || headerEmail) {
+  const headerUid = request.headers.get("x-cs-uid")?.trim();
+  const headerEmail = request.headers.get("x-cs-email")?.trim();
+  const headerName = request.headers.get("x-cs-name")?.trim();
+  if (headerUid && headerEmail) {
+    if (headerUid === "cs_lead_demo" || headerEmail.toLowerCase() === "cs.lead@kenit.com.br") {
+      return null;
+    }
     return {
-      uid:
-        headerUid ||
-        (headerEmail
-          ? headerEmail.toLowerCase().replace(/[^a-z0-9]/g, "_")
-          : "cs_analyst"),
-      email: headerEmail || "cs@kenit.com.br",
-      name: headerName || headerEmail?.split("@")[0] || "Analista de CS",
+      uid: headerUid,
+      email: headerEmail,
+      name: headerName ? decodeURIComponent(headerName) : headerEmail.split("@")[0],
     };
   }
 
   // 3. Extrai de query parameters (?csUid=...&csEmail=...)
   try {
     const url = new URL(request.url);
-    const qUid = url.searchParams.get("csUid");
-    const qEmail = url.searchParams.get("csEmail");
-    const qName = url.searchParams.get("csName");
-    if (qUid || qEmail) {
+    const qUid = url.searchParams.get("csUid")?.trim();
+    const qEmail = url.searchParams.get("csEmail")?.trim();
+    const qName = url.searchParams.get("csName")?.trim();
+    if (qUid && qEmail) {
+      if (qUid === "cs_lead_demo" || qEmail.toLowerCase() === "cs.lead@kenit.com.br") {
+        return null;
+      }
       return {
-        uid:
-          qUid ||
-          (qEmail
-            ? qEmail.toLowerCase().replace(/[^a-z0-9]/g, "_")
-            : "cs_analyst"),
-        email: qEmail || "cs@kenit.com.br",
-        name: qName || qEmail?.split("@")[0] || "Analista de CS",
+        uid: qUid,
+        email: qEmail,
+        name: qName ? decodeURIComponent(qName) : qEmail.split("@")[0],
       };
     }
   } catch {}
 
   // 4. Extrai de payload explícito enviado no body
   if (explicitData) {
-    const bUid = explicitData.csUid || explicitData.assignedCS?.uid;
-    const bEmail = explicitData.csEmail || explicitData.assignedCS?.email;
+    const bUid = (explicitData.csUid || explicitData.assignedCS?.uid)?.trim();
+    const bEmail = (explicitData.csEmail || explicitData.assignedCS?.email)?.trim();
     const bName = explicitData.csName || explicitData.assignedCS?.name;
-    if (bUid || bEmail) {
+    if (bUid && bEmail) {
+      if (bUid === "cs_lead_demo" || bEmail.toLowerCase() === "cs.lead@kenit.com.br") {
+        return null;
+      }
       return {
-        uid:
-          bUid ||
-          (bEmail
-            ? bEmail.toLowerCase().replace(/[^a-z0-9]/g, "_")
-            : "cs_analyst"),
-        email: bEmail || "cs@kenit.com.br",
-        name: bName || bEmail?.split("@")[0] || "Analista de CS",
+        uid: bUid,
+        email: bEmail,
+        name: bName || bEmail.split("@")[0],
       };
     }
   }

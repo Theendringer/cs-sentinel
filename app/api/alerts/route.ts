@@ -11,11 +11,12 @@ export const dynamic = "force-dynamic";
  */
 export async function GET(request: NextRequest) {
   try {
-    let csUser = null;
-    try {
-      csUser = await extractCSUser(request);
-    } catch (authErr: any) {
-      console.warn("⚠️ [/api/alerts] Falha ao extrair analista autenticado:", authErr.message);
+    const csUser = await extractCSUser(request);
+    if (!csUser || !csUser.uid || !csUser.email || csUser.uid === "cs_lead_demo") {
+      return NextResponse.json(
+        { error: "Acesso não autorizado. Faça login primeiro." },
+        { status: 401 }
+      );
     }
 
     const { searchParams } = new URL(request.url);

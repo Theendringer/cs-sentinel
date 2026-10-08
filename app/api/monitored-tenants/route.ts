@@ -14,7 +14,13 @@ export const dynamic = "force-dynamic";
 export async function GET(request: NextRequest) {
   try {
     const csUser = await extractCSUser(request);
-    const tenants = await getActiveMonitoredTenants(csUser || undefined);
+    if (!csUser || !csUser.uid || !csUser.email || csUser.uid === "cs_lead_demo") {
+      return NextResponse.json(
+        { error: "Acesso não autorizado. Faça login primeiro." },
+        { status: 401 }
+      );
+    }
+    const tenants = await getActiveMonitoredTenants(csUser);
 
     return NextResponse.json({
       success: true,
@@ -67,14 +73,21 @@ export async function POST(request: NextRequest) {
       assignedCS: firstItem.assignedCS,
     });
 
+    if (!authenticatedUser || !authenticatedUser.uid || !authenticatedUser.email || authenticatedUser.uid === "cs_lead_demo") {
+      return NextResponse.json(
+        { error: "Acesso não autorizado. Faça login primeiro." },
+        { status: 401 }
+      );
+    }
+
     console.log(
       `📥 [/api/monitored-tenants] Gravando ${items.length} entidade(s) para o analista: ${
-        authenticatedUser?.name || "Desconhecido"
-      } (${authenticatedUser?.email || "sem email"})...`
+        authenticatedUser.name
+      } (${authenticatedUser.email})...`
     );
 
     // 2. Gravação isolada por carteira com ID `${csUser.uid}_${entidadeId}`
-    const result = await upsertMonitoredTenants(items, authenticatedUser || undefined);
+    const result = await upsertMonitoredTenants(items, authenticatedUser);
 
     return NextResponse.json({
       success: result.success,

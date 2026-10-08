@@ -14,6 +14,14 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   try {
+    const csUser = await extractCSUser(request);
+    if (!csUser || !csUser.uid || !csUser.email || csUser.uid === "cs_lead_demo") {
+      return NextResponse.json(
+        { error: "Acesso não autorizado. Faça login primeiro." },
+        { status: 401 }
+      );
+    }
+
     const { id } = params;
 
     if (!id || !ObjectId.isValid(id)) {

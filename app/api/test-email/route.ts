@@ -41,12 +41,17 @@ export async function POST(request: NextRequest) {
 
     // Extrai o analista autenticado a partir do token Firebase ou headers
     const csUser = await extractCSUser(request, bodyData);
+    if (!csUser || !csUser.uid || !csUser.email || csUser.uid === "cs_lead_demo") {
+      return NextResponse.json(
+        { error: "Acesso não autorizado. Faça login primeiro." },
+        { status: 401 }
+      );
+    }
 
     const targetEmail =
       bodyData.to ||
       bodyData.email ||
-      csUser?.email ||
-      request.nextUrl.searchParams.get("csEmail");
+      csUser.email;
 
     if (!targetEmail) {
       return NextResponse.json(

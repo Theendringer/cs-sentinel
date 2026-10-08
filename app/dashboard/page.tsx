@@ -4,7 +4,7 @@ import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import { clientAuth } from "@/lib/firebase-client";
-import { onAuthStateChanged } from "firebase/auth";
+import { onAuthStateChanged, signOut } from "firebase/auth";
 import {
   LayoutDashboard,
   Search,
@@ -154,11 +154,11 @@ export default function DashboardPage() {
   const [showEmailPreviewModal, setShowEmailPreviewModal] = useState(false);
 
   // Usuário CS logado
-  const [currentUser, setCurrentUser] = useState({
-    uid: "cs_lead_demo",
-    name: "CS Leader Kenit",
-    email: "cs.lead@kenit.com.br",
-  });
+  const [currentUser, setCurrentUser] = useState<{
+    uid: string;
+    name: string;
+    email: string;
+  } | null>(null);
 
   // Auxiliar para obter cabeçalhos de autenticação e parâmetros de identificação do CS
   const getAuthContext = async (overrideUser?: {
@@ -176,15 +176,10 @@ export default function DashboardPage() {
       }
     }
 
-    const userObj = overrideUser || {
-      uid: activeUser?.uid || currentUser.uid || (currentUser.email ? currentUser.email.split("@")[0] : "cs_analyst"),
-      email: activeUser?.email || currentUser.email || "cs@kenit.com.br",
-      name: activeUser?.displayName || currentUser.name || "Analista CS",
-    };
-
-    const uid = activeUser?.uid || userObj.uid || userObj.email.split("@")[0];
-    const email = activeUser?.email || userObj.email;
-    const name = activeUser?.displayName || userObj.name || email.split("@")[0];
+    const userObj = overrideUser || currentUser;
+    const uid = activeUser?.uid || userObj?.uid || "";
+    const email = activeUser?.email || userObj?.email || "";
+    const name = activeUser?.displayName || userObj?.name || (email ? email.split("@")[0] : "");
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -215,22 +210,6 @@ export default function DashboardPage() {
 
   // Carregamento inicial de dados e sincronização automática com Firebase Auth
   useEffect(() => {
-    let resolvedUser = currentUser;
-    try {
-      const stored = localStorage.getItem("cs_sentinel_demo_user");
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed.email) {
-          resolvedUser = {
-            uid: parsed.uid || parsed.email.split("@")[0],
-            name: parsed.name || parsed.email.split("@")[0],
-            email: parsed.email,
-          };
-          setCurrentUser(resolvedUser);
-        }
-      }
-    } catch {}
-
     const unsubscribe = onAuthStateChanged(clientAuth, async (user) => {
       if (user && user.email) {
         const authUser = {
@@ -241,12 +220,13 @@ export default function DashboardPage() {
         setCurrentUser(authUser);
         fetchData(authUser);
       } else {
-        fetchData(resolvedUser);
+        setCurrentUser(null);
+        router.replace("/login");
       }
     });
 
     return () => unsubscribe();
-  }, []);
+  }, [router]);
 
   const fetchData = async (userContext?: { uid?: string; email?: string; name?: string }) => {
     setLoading(true);
@@ -568,7 +548,7 @@ export default function DashboardPage() {
     setShowExecutionModal(true);
     setAgentLogs([
       "[0s] 🚀 Inicializando Cockpit de IA da Kenit com Google Gemini...",
-      `[1s] 🔍 Consultando entidades da carteira de ${currentUser.name} para auditoria preventiva...`,
+      `[1s] 🔍 Consultando entidades da carteira de ${currentUser?.name || "CS"} para auditoria preventiva...`,
     ]);
     setExecutiveReport("");
     setExecutionResult(null);
@@ -635,7 +615,7 @@ export default function DashboardPage() {
 
       const data = await res.json();
       if (data.success) {
-        const recipient = data.recipient || currentUser.email;
+        const recipient = data.recipient || currentUser?.email || authCtx.email;
         setToastMessage({
           text: `E-mail de demonstração enviado para ${recipient}!`,
           type: "success",
@@ -662,11 +642,16 @@ export default function DashboardPage() {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     try {
       localStorage.removeItem("cs_sentinel_demo_user");
-    } catch {}
-    router.push("/login");
+      await signOut(clientAuth);
+    } catch (err) {
+      console.warn("Erro ao fazer signOut:", err);
+    } finally {
+      setCurrentUser(null);
+      router.replace("/login");
+    }
   };
 
   // Entidades filtradas na barra lateral
@@ -863,13 +848,15 @@ export default function DashboardPage() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2.5 min-w-0">
               <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-[#EEF0FF] text-xs font-bold text-[#1D00EB]">
-                {currentUser.name.charAt(0)}
+                {currentUser?.name ? currentUser.name.charAt(0).toUpperCase() : "CS"}
               </div>
               <div className="min-w-0">
                 <p className="truncate text-xs font-semibold text-slate-800">
-                  {currentUser.name}
+                  {currentUser?.name || "Analista de CS"}
                 </p>
-                <p className="truncate text-[10px] text-slate-400">{currentUser.email}</p>
+                <p className="truncate text-[10px] text-slate-400">
+                  {currentUser?.email || "Autenticado"}
+                </p>
               </div>
             </div>
 
@@ -916,7 +903,7 @@ export default function DashboardPage() {
                   Cockpit de Observabilidade & CS
                 </h1>
                 <span className="inline-flex items-center gap-1 rounded-full bg-[#1D00EB]/10 px-2.5 py-0.5 text-[11px] font-semibold text-[#1D00EB] border border-[#1D00EB]/20">
-                  Carteira: {currentUser.name}
+                  Carteira: {currentUser?.name || "Analista de CS"}
                 </span>
               </div>
               <p className="text-xs text-slate-500">
@@ -940,7 +927,7 @@ export default function DashboardPage() {
             <button
               onClick={handleSendTestEmail}
               disabled={sendingTestEmail}
-              title={`Disparar e-mail de demonstração para ${currentUser.email}`}
+              title={`Disparar e-mail de demonstração para ${currentUser?.email || "seu e-mail"}`}
               className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300 px-3.5 py-2 text-xs font-semibold text-slate-700 shadow-sm transition disabled:opacity-50"
             >
               {sendingTestEmail ? (
@@ -1477,10 +1464,10 @@ export default function DashboardPage() {
                                 </div>
                                 <div className="min-w-0 flex-1">
                                   <div className="text-xs font-bold text-slate-900 truncate">
-                                    {currentUser.name}
+                                    {currentUser?.name || "Analista de CS"}
                                   </div>
                                   <div className="text-[11px] text-slate-500 font-mono truncate">
-                                    {currentUser.email}
+                                    {currentUser?.email || "Autenticado"}
                                   </div>
                                 </div>
                               </div>
@@ -1558,7 +1545,7 @@ export default function DashboardPage() {
                     </span>
                   </div>
                   <p className="mt-1 text-[11px] text-slate-500">
-                    Na sua carteira ({currentUser.name})
+                    Na sua carteira ({currentUser?.name || "CS"})
                   </p>
                 </div>
 
@@ -1876,7 +1863,7 @@ export default function DashboardPage() {
                     Prévia do E-mail Prescritivo • Padrão Visual Kenit
                   </h3>
                   <p className="text-xs text-slate-500">
-                    Template HTML responsivo emitido para {currentUser.email}
+                    Template HTML responsivo emitido para {currentUser?.email || "o analista de CS"}
                   </p>
                 </div>
               </div>

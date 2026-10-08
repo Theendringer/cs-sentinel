@@ -33,14 +33,20 @@ export async function POST(request: NextRequest) {
     }
 
     const csUser = await extractCSUser(request, bodyData);
+    if (!csUser || !csUser.uid || !csUser.email || csUser.uid === "cs_lead_demo") {
+      return NextResponse.json(
+        { error: "Acesso não autorizado. Faça login primeiro." },
+        { status: 401 }
+      );
+    }
 
     console.log(
-      `🤖 [/api/run-agent] Disparo de auditoria solicitado via API${
-        csUser ? ` para CS: ${csUser.name || csUser.email || csUser.uid}` : " (Geral)"
+      `🤖 [/api/run-agent] Disparo de auditoria solicitado para CS: ${
+        csUser.name || csUser.email || csUser.uid
       }...`
     );
 
-    const auditResult = await runCustomerSuccessAudit(csUser || undefined);
+    const auditResult = await runCustomerSuccessAudit(csUser);
 
     return NextResponse.json({
       success: true,
