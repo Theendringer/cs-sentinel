@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI, SchemaType, ChatSession } from "@google/generative-ai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import {
   getActiveMonitoredTenants,
   saveCSAlert,
@@ -9,29 +9,8 @@ import {
 import { checkTenantHealthMetrics } from "./mongodb";
 import { sendPrescriptiveAlertEmail } from "./mailer";
 
-// Compatibilidade do SDK @google/generative-ai com Gemini 3.8 / 3.5
-// Garante que mensagens de functionResponse não usem o papel depreciado 'function'
-const originalSendMessage = ChatSession.prototype.sendMessage;
-ChatSession.prototype.sendMessage = async function (request: any, requestOptions: any = {}) {
-  if (this._history) {
-    for (const item of this._history) {
-      if (item && item.role === "function") {
-        item.role = "user";
-      }
-    }
-  }
-  const result = await originalSendMessage.call(this, request, requestOptions);
-  if (this._history) {
-    for (const item of this._history) {
-      if (item && item.role === "function") {
-        item.role = "user";
-      }
-    }
-  }
-  return result;
-};
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || "";
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const CS_WEBHOOK_URL = process.env.CS_WEBHOOK_URL || null;
 
@@ -64,194 +43,73 @@ function isRetryableError(error: any): boolean {
 }
 
 /**
- * Função auxiliar de envio com backoff exponencial
+ * Executa a chamada direta ao Gemini com retry exponencial e fallback de modelos estáveis
  */
-async function sendMessageWithRetry(
-  chat: any,
-  message: any,
-  maxRetries = 4,
-  delayMs = 3000,
+async function generateDiagnosisWithRetry(
+  genAI: GoogleGenerativeAI,
+  preferredModel: string,
+  prompt: string,
   logFn?: (msg: string) => void
-): Promise<any> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+): Promise<{ text: string; modelUsed: string }> {
+  // Lista de modelos compatíveis e estáveis para tentar em ordem
+  const modelsToTry = [
+    preferredModel,
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+    "gemini-flash-latest",
+  ];
+  const uniqueModels = Array.from(new Set(modelsToTry.filter(Boolean)));
+
+  let lastError: any = null;
+
+  for (const modelName of uniqueModels) {
     try {
-      return await chat.sendMessage(message);
-    } catch (error: any) {
-      const isRetryable = isRetryableError(error);
-      const isLastAttempt = attempt === maxRetries;
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: { responseMimeType: "application/json" },
+      });
 
-      if (!isRetryable || isLastAttempt) {
-        if (logFn) logFn(`❌ [Gemini API] Falha na tentativa ${attempt}/${maxRetries}: ${error.message}`);
-        throw error;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const res = await model.generateContent(prompt);
+          return { text: res.response.text(), modelUsed: modelName };
+        } catch (err: any) {
+          const isRetryable = isRetryableError(err);
+          if (isRetryable && attempt < 3) {
+            const delay = 2000 * attempt;
+            if (logFn) {
+              logFn(
+                `⚠️ [Gemini ${modelName}] Instabilidade temporária (${err.status || 503}). Aguardando ${delay}ms para tentativa ${attempt + 1}...`
+              );
+            }
+            await new Promise((r) => setTimeout(r, delay));
+            continue;
+          }
+          throw err;
+        }
       }
+    } catch (err: any) {
+      lastError = err;
+      const is404 =
+        err.status === 404 ||
+        err.message?.includes("404") ||
+        err.message?.includes("no longer available") ||
+        err.message?.includes("not found");
 
-      const currentDelay = delayMs * Math.pow(2, attempt - 1);
-      if (logFn) {
-        logFn(
-          `⚠️ [Gemini API] Instabilidade temporária (${error.status || "503/429"}). Aguardando ${currentDelay}ms para tentativa ${attempt + 1}/${maxRetries}...`
-        );
+      if (is404 && uniqueModels.indexOf(modelName) < uniqueModels.length - 1) {
+        if (logFn) {
+          logFn(`ℹ️ [Gemini API] Modelo '${modelName}' não disponível nesta conta. Tentando próximo modelo estável...`);
+        }
+        continue;
       }
-      await new Promise((resolve) => setTimeout(resolve, currentDelay));
+      throw err;
     }
   }
+
+  throw lastError;
 }
-
-/**
- * Declaração das ferramentas (Function Calling)
- */
-const toolsDeclarations: any[] = [
-  {
-    functionDeclarations: [
-      {
-        name: "getMonitoredTenants",
-        description:
-          "Busca no Firebase Firestore a lista de entidades ativas cadastradas pelo time de Customer Success para auditoria, incluindo os limites de tolerância (thresholds) e o CS responsável.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {},
-          required: [],
-        },
-      },
-      {
-        name: "checkTenantHealth",
-        description:
-          "Consulta a telemetria e erros de integração no MongoDB para uma entidade específica (converte entidadeId para ObjectId). Consulta a collection 'errosintegracoes' com status='pendente' e janela de 2h, filtrando opcionalmente pelos tiposMonitorados configurados no Firestore. Agrupa os erros por canal (layoutIntegracao) e tipo (tipoIntegracao), retornando padrões repetitivos, códigos afetados e mensagens de erro.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {
-            entidadeId: {
-              type: SchemaType.STRING,
-              description: "String hexadecimal do _id da entidade no MongoDB (ex.: '6a8ec64f20c8700f6efcdab2').",
-            },
-            diasSemAcesso: {
-              type: SchemaType.NUMBER,
-              description:
-                "Janela em dias para considerar inatividade (padrão 7 ou o valor de diasSemAcessoAlerta configurado nos thresholds da entidade).",
-            },
-            tiposMonitorados: {
-              type: SchemaType.ARRAY,
-              items: { type: SchemaType.STRING },
-              description:
-                "Lista de tipos de integração configurados no threshold da entidade para filtrar os erros (ex: ['anuncio', 'pedido', 'estoque']). Se vazio ou omitido, audita todos os tipos.",
-            },
-          },
-          required: ["entidadeId"],
-        },
-      },
-      {
-        name: "sendCSAlert",
-        description:
-          "Dispara um alerta preventivo de CS quando anomalias operacionais ou riscos de churn são detectados. Persiste/atualiza o alerta no Firestore com chave única por entidade/risco, dispara notificação por e-mail para o CS e envia webhook.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {
-            entidadeId: {
-              type: SchemaType.STRING,
-              description: "String hexadecimal do _id da entidade no MongoDB (ex.: '6a8ec64f20c8700f6efcdab2').",
-            },
-            entidadeNome: {
-              type: SchemaType.STRING,
-              description: "Nome visual da empresa/entidade.",
-            },
-            csEmail: {
-              type: SchemaType.STRING,
-              description: "E-mail do Customer Success Manager responsável.",
-            },
-            csName: {
-              type: SchemaType.STRING,
-              description: "Nome do Customer Success Manager responsável.",
-            },
-            tipoRisco: {
-              type: SchemaType.STRING,
-              description:
-                "Tipo de risco: 'RISCO OPERACIONAL DE INTEGRAÇÃO', 'RISCO TECNICO CRITICO' ou 'RISCO DE CHURN / DESENGAJAMENTO'.",
-            },
-            motivo: {
-              type: SchemaType.STRING,
-              description: "Diagnóstico em linguagem de negócios indicando o canal (layoutIntegracao), tipo de falha, volume e padrão detectado.",
-            },
-            acaoRecomendada: {
-              type: SchemaType.STRING,
-              description: "Estratégia prescritiva de CS: Impacto comercial direto + Roteiro de contato preventivo pronto para o CS contatar o cliente antes da abertura de chamados.",
-            },
-          },
-          required: ["entidadeNome", "csEmail", "csName", "tipoRisco", "motivo", "acaoRecomendada"],
-        },
-      },
-      {
-        name: "resolveTenantAlerts",
-        description:
-          "Se a entidade estiver saudável (sem falhas críticas de integração e com engajamento de usuários normal), marca os alertas anteriores em aberto como 'resolvido' no Firestore.",
-        parameters: {
-          type: SchemaType.OBJECT,
-          properties: {
-            entidadeId: {
-              type: SchemaType.STRING,
-              description: "ID da entidade no MongoDB.",
-            },
-            entidadeNome: {
-              type: SchemaType.STRING,
-              description: "Nome visual da empresa/entidade.",
-            },
-            motivo: {
-              type: SchemaType.STRING,
-              description: "Motivo da resolução (ex: 'Operação sem falhas recentes e adesão estável').",
-            },
-          },
-          required: ["entidadeId"],
-        },
-      },
-    ],
-  },
-];
-
-const SYSTEM_INSTRUCTION = `
-Você é o Agente Sentinela de Customer Success (CS) Preventivo e Observabilidade de Negócios da Kenit.
-Sua missão é atuar proativamente na retenção de clientes e prevenção de cancelamentos (churn), auditando métricas e falhas de integrações de e-commerce/marketplaces em tempo real para antecipar crises ANTES que o cliente perceba ou abra um chamado de suporte.
-
-DIRETRIZ CENTRAL DE ATUAÇÃO (FOCO EM CS E NEGÓCIO):
-- Você NÃO precisa resolver o problema técnico no código nem tentar consertar APIs/bancos.
-- SEU FOCO É PURAMENTE ANALÍTICO E PRESCRITIVO DE CUSTOMER SUCCESS:
-  1. Analisar o conjunto de falhas na collection 'errosintegracoes'.
-  2. Identificar o canal/integração afetado ('layoutIntegracao', ex: VTEX, Mercado Livre, Shopee, Magalu) e o tipo ('tipoIntegracao', ex: Anúncio, Pedido, Estoque, Preço).
-  3. Reconhecer padrões recorrentes: identificar se a mesma mensagem de falha (ex: "Dados inconsistentes no cadastro de EAN", "Token expirado", "Preço divergente") está se repetindo em múltiplos produtos, pedidos ou anúncios (verificando 'codigosAfetados' e as mensagens de erro).
-  4. Traduzir a falha técnica em IMPACTO COMERCIAL real para o lojista (ex: "Os anúncios da VTEX estão travados devido a divergência no cadastro de EAN, impedindo a sincronização e geração de vendas").
-  5. Formular um ROTEIRO DE CONTATO PREVENTIVO pronto para o CS contatar o cliente antes que o cliente abra um chamado, demonstrando domínio proativo da operação.
-
-FLUXO OPERACIONAL OBRIGATÓRIO:
-1. Comece chamando a ferramenta 'getMonitoredTenants()' para obter as empresas cadastradas no Firestore pelo time de CS.
-2. Para CADA entidade retornada:
-   - Extraia 'entidadeId', 'nome', os dados do CS responsável ('assignedCS') e os 'thresholds' (incluindo 'maxErros2h', 'diasSemAcessoAlerta' e 'tiposMonitorados').
-   - Execute a ferramenta 'checkTenantHealth' passando:
-     * 'entidadeId': o ID da entidade no MongoDB.
-     * 'diasSemAcesso': valor de diasSemAcessoAlerta (padrão 7).
-     * 'tiposMonitorados': o array thresholds.tiposMonitorados configurado para a entidade (se não houver tipos selecionados, passe vazio ou omita para monitorar todos).
-3. AVALIAÇÃO DE RISCO E DISPARO DE ALERTAS:
-   - REGRA 1 (Instabilidade Operacional / Erros em Integrações):
-     Se a contagem de erros recentes nas últimas 2h (errosRecentesUltimas2h) for maior que 'thresholds.maxErros2h' (ou se houver grupo crítico de erros com padrões repetitivos):
-     Dispare IMEDIATAMENTE a ferramenta 'sendCSAlert' passando 'entidadeId', 'entidadeNome', dados do CS e:
-       - tipoRisco: 'RISCO OPERACIONAL DE INTEGRAÇÃO'
-       - motivo: Diagnóstico executivo identificando o canal (layoutIntegracao, ex: VTEX), o tipo de integração (tipoIntegracao, ex: anúncio), volume de itens afetados e o padrão da mensagem principal.
-       - acaoRecomendada:
-         * Impacto Comercial: Explicação em linguagem de negócios sobre o prejuízo ou travamento das vendas do cliente.
-         * Roteiro Prescritivo de Contato: Mensagem pronta para o CS abordar o cliente proativamente.
-   
-   - REGRA 2 (Risco de Churn / Desengajamento):
-     Se 'usuariosAtivosNoPeriodo == 0' ou adesão drasticamente baixa nos últimos dias:
-     Dispare IMEDIATAMENTE a ferramenta 'sendCSAlert' passando 'entidadeId', 'entidadeNome', dados do CS e:
-       - tipoRisco: 'RISCO DE CHURN / DESENGAJAMENTO'
-       - motivo: Inatividade identificada no período.
-       - acaoRecomendada: Roteiro empático de reengajamento para o CS agendar reunião de alinhamento de valor.
-   
-   - REGRA 3 (Cliente Saudável):
-     Se a entidade não violar os limites operacionais e apresentar engajamento adequado:
-     Execute a ferramenta 'resolveTenantAlerts' passando 'entidadeId' para marcar alertas anteriores pendentes como 'resolvido' no Firestore.
-     Registre como saudável para o relatório final.
-
-DIRETRIZES DE COMUNICAÇÃO:
-- Sempre se refira à empresa pelo campo 'nome' para facilitar a identificação humana.
-- Ao final de todas as auditorias, elabore um Relatório Executivo Consolidado com resumo das contas analisadas, canais afetados, alertas emitidos e próximos passos.
-`;
 
 export interface AuditExecutionResult {
   success: boolean;
@@ -266,7 +124,14 @@ export interface AuditExecutionResult {
 
 /**
  * Função executável principal para rodar a auditoria completa de Customer Success.
- * Pode ser chamada via CLI, por Route Handler de API Next.js ou Cron de automação.
+ * 
+ * Arquitetura Otimizada para Serverless (Vercel):
+ * 1. Busca primeiro as entidades monitoradas no Firestore (isoladas pela carteira do CS).
+ * 2. Consulta a telemetria e erros recentes (errosintegracoes) diretamente no MongoDB.
+ * 3. Para contas com anomalias detectadas, faz chamada direta e atômica ao Gemini via generateContent
+ *    com retorno em JSON estruturado, eliminando loops de function calling e prevenindo o erro de role 'function'.
+ * 4. Persiste o alerta no Firestore ('cs_alerts_history'), dispara e-mail prescritivo e webhook.
+ * 5. Resolve alertas de contas saudáveis e consolida o Relatório Executivo Final.
  */
 export async function runCustomerSuccessAudit(
   csFilter?: CSUserFilter
@@ -280,6 +145,7 @@ export async function runCustomerSuccessAudit(
   const analystContext = csFilter?.name
     ? ` para a carteira do analista de CS ${csFilter.name} (${csFilter.email || csFilter.uid || ""})`
     : "";
+
   const apiKey =
     process.env.GEMINI_API_KEY ||
     process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
@@ -291,260 +157,283 @@ export async function runCustomerSuccessAudit(
     );
   }
 
-  // Garante que o modelo utilizado seja estável e rápido (gemini-3.5-flash-lite ou o configurado em GEMINI_MODEL)
-  let modelName = (process.env.GEMINI_MODEL || GEMINI_MODEL || "gemini-3.5-flash-lite").trim();
-  if (!modelName || modelName === "gemini-2.5-flash") {
-    // Caso gemini-2.5-flash esteja depreciado para novas contas na API do Google Studio, utiliza gemini-3.5-flash-lite
-    modelName = "gemini-3.5-flash-lite";
-  }
-
-  log(`🚀 Iniciando Auditoria Preventiva de CS${analystContext}. Modelo: ${modelName}`);
+  const preferredModel = (process.env.GEMINI_MODEL || GEMINI_MODEL).trim();
+  log(`🚀 Iniciando Auditoria Preventiva de CS${analystContext}. Modelo configurado: ${preferredModel}`);
 
   const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
-    model: modelName,
-    systemInstruction: SYSTEM_INSTRUCTION,
-    tools: toolsDeclarations,
-  });
 
-  const chat = model.startChat();
-  const promptInicial =
-    `Inicie a auditoria preventiva de Customer Success${analystContext}. Consulte as entidades monitoradas ativas no Firebase, ` +
-    "analise a telemetria de cada uma no MongoDB, deduplique alertas no Firestore e emita notificações prescritivas por e-mail para os analistas de CS.";
+  // 1. Busca as entidades monitoradas ativas no Firestore
+  log("📋 Consultando entidades monitoradas ativas no Firestore...");
+  const monitoredTenants = await getActiveMonitoredTenants(csFilter);
+  log(`✅ ${monitoredTenants.length} entidade(s) ativa(s) carregada(s) do Firestore.`);
 
-  log(`👤 [Comando]: "${promptInicial}"`);
-  let response = await sendMessageWithRetry(chat, promptInicial, 4, 3000, log);
+  if (monitoredTenants.length === 0) {
+    const emptyMsg = csFilter?.name
+      ? `Nenhuma empresa ativa monitorada na carteira do analista ${csFilter.name}. Adicione contas no painel de monitoramento.`
+      : "Nenhuma empresa ativa configurada para monitoramento no momento.";
+    log(`ℹ️ ${emptyMsg}`);
 
-  let stepCount = 1;
-  const MAX_AGENT_STEPS = 25;
+    return {
+      success: true,
+      timestamp: new Date().toISOString(),
+      model: preferredModel,
+      totalEntitiesAudited: 0,
+      totalAlertsDispatched: 0,
+      alertsDispatched: [],
+      executiveReport: `# Relatório Executivo Consolidado - Sentinel CS\n\n${emptyMsg}`,
+      logs: executionLogs,
+    };
+  }
+
   const dispatchedAlerts: any[] = [];
-  let auditedEntitiesCount = 0;
-  let loadedTenants: MonitoredTenant[] = [];
-  const tenantsWithDispatchedAlerts = new Set<string>();
-  const tenantsAuditedHealthy = new Set<string>();
+  const healthyTenants: string[] = [];
+  const riskyTenants: { nome: string; motivo: string; tipoRisco: string }[] = [];
+  let finalModelUsed = preferredModel;
 
-  while (stepCount <= MAX_AGENT_STEPS) {
-    const candidate = response.response;
-    const functionCalls = candidate.functionCalls();
+  // 2. Itera sobre cada entidade, avaliando telemetria e gerando diagnóstico
+  for (const tenant of monitoredTenants) {
+    log(`🔍 Auditando telemetria da conta: ${tenant.nome} (${tenant.entidadeId})...`);
 
-    if (!functionCalls || functionCalls.length === 0) {
-      log("🏁 O Agente concluiu todas as auditorias e finalizou o plano de ação.");
-      break;
+    const diasInatividade = tenant.thresholds.diasSemAcessoAlerta || 7;
+    const maxErrosPermitidos = tenant.thresholds.maxErros2h ?? 5;
+    const tiposMonitorados = tenant.thresholds.tiposMonitorados || [];
+
+    const rawHealth = (await checkTenantHealthMetrics(
+      tenant.entidadeId,
+      diasInatividade,
+      tiposMonitorados
+    )) as any;
+
+    if (rawHealth.error) {
+      log(`⚠️ [MongoDB] Erro ao consultar telemetria de ${tenant.nome}: ${rawHealth.error}`);
+      continue;
     }
 
-    log(`🔄 [Turno ${stepCount}] O modelo requisitou ${functionCalls.length} chamada(s) de ferramenta:`);
-    const functionResponses: any[] = [];
+    const errosRecentes = rawHealth.errosRecentesUltimas2h ?? 0;
+    const usuariosAtivos = rawHealth.usuariosAtivosNoPeriodo ?? 0;
+    const totalUsuarios = rawHealth.totalUsuariosCadastrados ?? 0;
 
-    for (const call of functionCalls) {
-      const { name, args } = call;
-      log(`   ⚙️ Executando Tool: ${name}(${JSON.stringify(args)})`);
+    log(
+      `   📊 Métricas: ${errosRecentes} erros nas últimas 2h (limite: ${maxErrosPermitidos}) | ${usuariosAtivos}/${totalUsuarios} usuários ativos`
+    );
 
-      let toolResult: any;
+    const temRiscoErros = errosRecentes > maxErrosPermitidos;
+    const temRiscoChurn = totalUsuarios > 0 && usuariosAtivos === 0;
 
+    // Cenário Saudável: erros dentro do limite e engajamento adequado
+    if (!temRiscoErros && !temRiscoChurn) {
+      healthyTenants.push(tenant.nome);
+      log(`   ✅ Conta "${tenant.nome}" considerada saudável.`);
+
+      // Resolve alertas anteriores no Firestore
       try {
-        if (name === "getMonitoredTenants") {
-          const tenants = await getActiveMonitoredTenants(csFilter);
-          loadedTenants = tenants;
-          auditedEntitiesCount = tenants.length;
-          toolResult = { total: tenants.length, monitoredTenants: tenants };
-          log(
-            `   📋 ${tenants.length} entidade(s) ativa(s) carregada(s) do Firestore${
-              csFilter ? ` (Carteira: ${csFilter.email || csFilter.name || csFilter.uid})` : ""
-            }.`
-          );
-        } else if (name === "checkTenantHealth") {
-          const { entidadeId, diasSemAcesso, tiposMonitorados } = args as any;
-          const rawHealth = (await checkTenantHealthMetrics(entidadeId, diasSemAcesso, tiposMonitorados)) as any;
-          log(`   📊 Telemetria processada para ${rawHealth.nomeEntidade || entidadeId}`);
-
-          // Avalia se métricas estão em patamar saudável
-          const tenantConfig = loadedTenants.find((t) => t.entidadeId === entidadeId);
-          const maxErros = tenantConfig?.thresholds.maxErros2h ?? 5;
-          const errosRecentes = rawHealth.errosRecentesUltimas2h ?? 0;
-          const usuariosAtivos = rawHealth.usuariosAtivosNoPeriodo ?? 0;
-
-          if (errosRecentes <= maxErros && usuariosAtivos > 0) {
-            tenantsAuditedHealthy.add(entidadeId);
-          }
-
-          // Envia resumo estruturado e enxuto para a IA não estourar tokens/tempo
-          toolResult = {
-            entidadeId: rawHealth.entidadeId || entidadeId,
-            nomeEntidade: rawHealth.nomeEntidade,
-            totalUsuariosCadastrados: rawHealth.totalUsuariosCadastrados,
-            usuariosAtivosNoPeriodo: rawHealth.usuariosAtivosNoPeriodo,
-            totalUsuariosInativos: rawHealth.totalUsuariosInativos,
-            errosRecentesUltimas2h: rawHealth.errosRecentesUltimas2h,
-            resumoErrosPorCanal: (rawHealth.gruposErros || []).map((g: any) => ({
-              canal: g.layoutIntegracao,
-              tipo: g.tipoIntegracao,
-              totalErros: g.totalErros,
-              amostraMensagens: g.amostraMensagens?.slice(0, 2) || [],
-            })),
-            amostraMensagens: (rawHealth.amostraErros || []).slice(0, 3),
-            periodoDiasAnalise: rawHealth.periodoDiasAnalise,
-          };
-        } else if (name === "sendCSAlert") {
-          const {
-            entidadeId: argEntidadeId,
-            entidadeNome,
-            csEmail,
-            csName,
-            tipoRisco,
-            motivo,
-            acaoRecomendada,
-          } = args as any;
-
-          // Resolve o entidadeId correspondente
-          const matchedTenant = loadedTenants.find(
-            (t) =>
-              t.entidadeId === argEntidadeId ||
-              t.nome.toLowerCase() === (entidadeNome || "").toLowerCase()
-          );
-          const resolvedEntidadeId =
-            argEntidadeId ||
-            matchedTenant?.entidadeId ||
-            (entidadeNome ? entidadeNome.toLowerCase().replace(/[^a-z0-9]/g, "_") : "entidade");
-
-          tenantsWithDispatchedAlerts.add(resolvedEntidadeId);
-          tenantsAuditedHealthy.delete(resolvedEntidadeId);
-
-          const targetCsUid = csFilter?.uid || matchedTenant?.assignedCS?.uid;
-          const targetCsEmail =
-            csEmail || csFilter?.email || matchedTenant?.assignedCS?.email || "cs@kenit.com.br";
-          const targetCsName =
-            csName || csFilter?.name || matchedTenant?.assignedCS?.name || "Time de CS";
-
-          const alertPayload = {
-            entidadeId: resolvedEntidadeId,
-            entidadeNome,
-            csUid: targetCsUid,
-            csEmail: targetCsEmail,
-            csName: targetCsName,
-            assignedCS: {
-              uid: targetCsUid,
-              name: targetCsName,
-              email: targetCsEmail,
-            },
-            tipoRisco,
-            motivo,
-            acaoRecomendada,
-            status: "ativo" as const,
-            disparadoEm: new Date().toISOString(),
-            origem: "cs-agent-sentinel",
-          };
-
-          // Salva/Atualiza no Firestore com chave única determinística
-          const docId = await saveCSAlert(alertPayload, targetCsUid);
-          dispatchedAlerts.push({ ...alertPayload, id: docId });
-          log(`   🚨 ALERTA [${tipoRisco}] para "${entidadeNome}" registrado (Upsert doc: ${docId})`);
-
-          // Envio automático do E-mail Prescritivo para o analista de CS responsável
-          try {
-            const emailResult = await sendPrescriptiveAlertEmail({
-              to: alertPayload.csEmail,
-              csName: alertPayload.csName,
-              entidadeNome: alertPayload.entidadeNome,
-              tipoRisco: alertPayload.tipoRisco,
-              motivo: alertPayload.motivo,
-              acaoRecomendada: alertPayload.acaoRecomendada,
-            });
-            log(
-              `   ✉️ E-mail prescritivo processado para ${alertPayload.csEmail} (provedor: ${emailResult.provider}, id: ${emailResult.messageId || "ok"})`
-            );
-          } catch (mailErr: any) {
-            log(`   ⚠️ Erro ao enviar e-mail prescritivo: ${mailErr.message}`);
-          }
-
-          // Disparo de Webhook opcional corporativo
-          if (CS_WEBHOOK_URL) {
-            try {
-              await fetch(CS_WEBHOOK_URL, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(alertPayload),
-              });
-              log(`   🌐 Webhook corporativo disparado com sucesso.`);
-            } catch (err: any) {
-              log(`   ⚠️ Erro no webhook corporativo: ${err.message}`);
-            }
-          }
-
-          toolResult = {
-            status: "DISPATCHED_OR_UPDATED",
-            entidadeId: resolvedEntidadeId,
-            entidadeNome,
-            tipoRisco,
-            firestoreDocId: docId,
-            timestamp: alertPayload.disparadoEm,
-          };
-        } else if (name === "resolveTenantAlerts") {
-          const { entidadeId: argEntidadeId, motivo } = args as any;
-          const targetCsUid = csFilter?.uid;
-          const resolvedCount = await resolveTenantAlerts(
-            argEntidadeId,
-            motivo || "Conta saudável na última auditoria",
-            targetCsUid
-          );
-          log(`   ✅ Alertas anteriores da entidade '${argEntidadeId}' resolvidos (${resolvedCount} documento(s)).`);
-          toolResult = {
-            status: "RESOLVED",
-            entidadeId: argEntidadeId,
-            resolvedCount,
-          };
-        } else {
-          toolResult = { error: `Ferramenta desconhecida: ${name}` };
+        const resolvedCount = await resolveTenantAlerts(
+          tenant.entidadeId,
+          "Operação saudável e engajamento normal na última auditoria.",
+          csFilter?.uid
+        );
+        if (resolvedCount > 0) {
+          log(`   🔄 ${resolvedCount} alerta(s) anterior(es) marcado(s) como resolvido(s).`);
         }
       } catch (err: any) {
-        log(`   ❌ Erro ao executar ${name}: ${err.message}`);
-        toolResult = { error: err.message };
+        log(`   ⚠️ Erro ao resolver alertas anteriores: ${err.message}`);
       }
-
-      functionResponses.push({
-        functionResponse: {
-          name,
-          response: toolResult,
-        },
-      });
+      continue;
     }
 
-    log(`📤 Enviando respostas de volta ao modelo Gemini...`);
-    response = await sendMessageWithRetry(chat, functionResponses, 4, 3000, log);
-    stepCount++;
-  }
+    // Cenário de Risco Identificado: Aciona o Gemini para gerar diagnóstico prescritivo
+    log(`   ⚠️ Risco detectado para "${tenant.nome}". Solicitando diagnóstico à IA...`);
 
-  // Resolução pós-auditoria para qualquer entidade saudável que não teve novos alertas
-  for (const tenantId of tenantsAuditedHealthy) {
-    if (!tenantsWithDispatchedAlerts.has(tenantId)) {
-      await resolveTenantAlerts(
-        tenantId,
-        "Auditoria concluiu que a conta está saudável (sem falhas críticas e com engajamento normal).",
-        csFilter?.uid
+    const resumoErros = (rawHealth.gruposErros || []).map((g: any) => ({
+      canal: g.layoutIntegracao,
+      tipo: g.tipoIntegracao,
+      totalErros: g.totalErros,
+      amostraMensagens: g.amostraMensagens?.slice(0, 3) || [],
+      codigosAfetados: g.codigosAfetados?.slice(0, 5) || [],
+    }));
+
+    const dadosAuditoria = {
+      empresa: tenant.nome,
+      entidadeId: tenant.entidadeId,
+      csResponsavel: tenant.assignedCS,
+      limiteMaxErrosTolerados: maxErrosPermitidos,
+      errosDetectadosUltimas2h: errosRecentes,
+      totalUsuariosCadastrados: totalUsuarios,
+      usuariosAtivos7d: usuariosAtivos,
+      resumoGruposErros: resumoErros,
+      amostraGeralMensagens: (rawHealth.amostraErros || []).slice(0, 5),
+    };
+
+    const prompt = `Você é o Sentinel IA, especialista em Customer Success e Observabilidade Preventiva da Kenit.
+Analise os dados de telemetria e erros recentes de integração da empresa "${tenant.nome}":
+${JSON.stringify(dadosAuditoria, null, 2)}
+
+DIRETRIZES DE CS:
+1. Identifique o padrão recorrente nos erros e os canais de integração impactados (ex: VTEX, Mercado Livre, Shopee).
+2. Avalie o impacto comercial real para a operação do cliente.
+3. Elabore um ROTEIRO DE CONTATO PREVENTIVO pronto para o analista de CS contatar o cliente antes que o cliente abra um chamado.
+
+Retorne EXCLUSIVAMENTE um objeto JSON válido (sem tags markdown ou texto fora do JSON) com a estrutura:
+{
+  "nivelRisco": "baixo" | "medio" | "alto" | "critico",
+  "tipoRisco": "RISCO OPERACIONAL DE INTEGRAÇÃO" | "RISCO DE CHURN / DESENGAJAMENTO" | "RISCO TECNICO CRITICO",
+  "resumo": "Diagnóstico executivo claro indicando canal afetado, volume de falhas e padrão do erro",
+  "estrategiaCS": "Roteiro prescritivo de abordagem empática e consultiva pronto para o analista de CS usar no contato",
+  "sugestaoAcao": "Passos técnicos e operacionais recomendados para mitigar a crise"
+}`;
+
+    let aiDiagnosis: any = null;
+
+    try {
+      const { text, modelUsed } = await generateDiagnosisWithRetry(
+        genAI,
+        preferredModel,
+        prompt,
+        log
       );
+      finalModelUsed = modelUsed;
+
+      // Parse defensivo do JSON retornado pelo modelo
+      try {
+        aiDiagnosis = JSON.parse(text);
+      } catch {
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          aiDiagnosis = JSON.parse(jsonMatch[0]);
+        }
+      }
+    } catch (aiErr: any) {
+      log(`   ❌ Falha na chamada da IA para ${tenant.nome}: ${aiErr.message}`);
+    }
+
+    // Fallback estruturado caso a IA falhe ou JSON venha incompleto
+    if (!aiDiagnosis) {
+      aiDiagnosis = {
+        nivelRisco: temRiscoErros ? "alto" : "medio",
+        tipoRisco: temRiscoErros
+          ? "RISCO OPERACIONAL DE INTEGRAÇÃO"
+          : "RISCO DE CHURN / DESENGAJAMENTO",
+        resumo: temRiscoErros
+          ? `${errosRecentes} falhas recentes de integração detectadas nas últimas 2h para a empresa ${tenant.nome}.`
+          : `Nenhum usuário ativo identificado nos últimos ${diasInatividade} dias para a empresa ${tenant.nome}.`,
+        estrategiaCS:
+          "Realizar contato imediato com o ponto focal para validar a estabilidade das operações e alinhar plano de mitigação.",
+        sugestaoAcao:
+          "Auditar logs das integrações pendentes e agendar reunião de alinhamento com a liderança do cliente.",
+      };
+    }
+
+    const targetCsUid = csFilter?.uid || tenant.assignedCS?.uid;
+    const targetCsEmail =
+      csFilter?.email || tenant.assignedCS?.email || "cs@kenit.com.br";
+    const targetCsName =
+      csFilter?.name || tenant.assignedCS?.name || "Time de CS";
+
+    const alertPayload = {
+      entidadeId: tenant.entidadeId,
+      entidadeNome: tenant.nome,
+      csUid: targetCsUid,
+      csEmail: targetCsEmail,
+      csName: targetCsName,
+      assignedCS: {
+        uid: targetCsUid,
+        name: targetCsName,
+        email: targetCsEmail,
+      },
+      tipoRisco:
+        aiDiagnosis.tipoRisco ||
+        (temRiscoErros
+          ? "RISCO OPERACIONAL DE INTEGRAÇÃO"
+          : "RISCO DE CHURN / DESENGAJAMENTO"),
+      motivo: aiDiagnosis.resumo,
+      acaoRecomendada: `${aiDiagnosis.estrategiaCS}\n\nRecomendações Práticas: ${aiDiagnosis.sugestaoAcao}`,
+      status: "ativo" as const,
+      disparadoEm: new Date().toISOString(),
+      origem: "cs-agent-sentinel",
+    };
+
+    // 3. Salva no Firestore ('cs_alerts_history') com chave determinística deduplicada
+    try {
+      const docId = await saveCSAlert(alertPayload, targetCsUid);
+      dispatchedAlerts.push({ ...alertPayload, id: docId, nivelRisco: aiDiagnosis.nivelRisco });
+      riskyTenants.push({
+        nome: tenant.nome,
+        motivo: aiDiagnosis.resumo,
+        tipoRisco: alertPayload.tipoRisco,
+      });
+      log(`   🚨 ALERTA [${alertPayload.tipoRisco}] registrado no Firestore (Doc: ${docId})`);
+    } catch (saveErr: any) {
+      log(`   ❌ Erro ao salvar alerta no Firestore: ${saveErr.message}`);
+    }
+
+    // 4. Dispara e-mail prescritivo para o CS responsável
+    try {
+      const emailResult = await sendPrescriptiveAlertEmail({
+        to: alertPayload.csEmail,
+        csName: alertPayload.csName,
+        entidadeNome: alertPayload.entidadeNome,
+        tipoRisco: alertPayload.tipoRisco,
+        motivo: alertPayload.motivo,
+        acaoRecomendada: alertPayload.acaoRecomendada,
+      });
+      log(
+        `   ✉️ E-mail prescritivo enviado para ${alertPayload.csEmail} (provedor: ${emailResult.provider})`
+      );
+    } catch (mailErr: any) {
+      log(`   ⚠️ Erro ao disparar e-mail prescritivo: ${mailErr.message}`);
+    }
+
+    // 5. Dispara webhook corporativo opcional
+    if (CS_WEBHOOK_URL) {
+      try {
+        await fetch(CS_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(alertPayload),
+        });
+        log(`   🌐 Webhook corporativo notificado.`);
+      } catch (hookErr: any) {
+        log(`   ⚠️ Erro ao disparar webhook: ${hookErr.message}`);
+      }
     }
   }
 
-  let finalReport = "";
-  try {
-    finalReport = response.response.text();
-  } catch {
-    const parts = response.response.candidates?.[0]?.content?.parts || [];
-    finalReport = parts
-      .filter((p: any) => typeof p.text === "string")
-      .map((p: any) => p.text)
-      .join("\n");
+  // 6. Monta o Relatório Executivo Consolidado
+  const agoraStr = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+  let report = `# Relatório Executivo Consolidado - Sentinel CS\n\n`;
+  report += `**Data da Auditoria:** ${agoraStr}\n`;
+  report += `**Modelo de IA Utilizado:** \`${finalModelUsed}\`\n`;
+  report += `**Total de Contas Auditadas:** ${monitoredTenants.length}\n`;
+  report += `**Alertas Preventivos Emitidos:** ${dispatchedAlerts.length}\n`;
+  report += `**Contas em Situação Saudável:** ${healthyTenants.length}\n\n`;
+
+  if (riskyTenants.length > 0) {
+    report += `### 🚨 Contas que Requerem Intervenção Imediata:\n`;
+    for (const r of riskyTenants) {
+      report += `- **${r.nome}** [${r.tipoRisco}]\n  - *Diagnóstico:* ${r.motivo}\n`;
+    }
+    report += `\n`;
   }
 
-  log("📊 Relatório Executivo Final gerado com sucesso.");
+  if (healthyTenants.length > 0) {
+    report += `### ✅ Contas com Operação Estável:\n`;
+    report += healthyTenants.map((nome) => `- ${nome}`).join("\n") + "\n\n";
+  }
+
+  report += `### 📌 Próximos Passos:\n`;
+  report += `1. Analistas de CS devem executar os roteiros prescritivos enviados por e-mail.\n`;
+  report += `2. Acompanhar a evolução das filas de erro na collection \`errosintegracoes\` no próximo ciclo de monitoramento.\n`;
+
+  log("📊 Auditoria concluída e Relatório Executivo gerado.");
 
   return {
     success: true,
     timestamp: new Date().toISOString(),
-    model: modelName,
-    totalEntitiesAudited: auditedEntitiesCount,
+    model: finalModelUsed,
+    totalEntitiesAudited: monitoredTenants.length,
     totalAlertsDispatched: dispatchedAlerts.length,
     alertsDispatched: dispatchedAlerts,
-    executiveReport: finalReport || "Auditoria concluída sem texto adicional.",
+    executiveReport: report,
     logs: executionLogs,
   };
 }
