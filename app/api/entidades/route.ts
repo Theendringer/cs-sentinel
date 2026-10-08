@@ -9,25 +9,36 @@ export const dynamic = "force-dynamic";
  * - Consulta todas as empresas no MongoDB (READ-ONLY).
  * - Busca no Firestore a carteira filtrando estritamente por assignedCS.uid == user.uid (ou email).
  * - Retorna isMonitored: true e active: true apenas para as empresas que o analista logado escolheu monitorar.
+ * - Totalmente resiliente: falhas no Firestore não derrubam a listagem de entidades do MongoDB.
  */
 export async function GET(request: NextRequest) {
   try {
-    const csUser = await extractCSUser(request);
-    const dbName = process.env.MONGODB_DB_NAME || "hackathon_db";
+    let csUser = null;
+    try {
+      csUser = await extractCSUser(request);
+    } catch (authErr: any) {
+      console.warn("⚠️ [Auth CS] Falha ao extrair analista autenticado:", authErr.message);
+    }
+
     console.log(
       `🍃 [MongoDB READ-ONLY] Listando empresas para o CS: ${csUser?.name || "Geral"} (${
         csUser?.email || "sem email"
       })...`
     );
 
-    const db = await getMongoDb();
+    // 1. Busca todas as empresas no MongoDB (isolado em bloco próprio)
+    let entidades: any[] = [];
+    try {
+      const db = await getMongoDb();
+      entidades = await db.collection("entidades").find({}).toArray();
+      console.log(`🍃 [MongoDB] ${entidades.length} entidade(s) encontrada(s) no banco.`);
+    } catch (mongoErr: any) {
+      console.error("❌ [MongoDB Error]:", mongoErr);
+      throw new Error(`Falha ao conectar ou buscar entidades no MongoDB: ${mongoErr.message || mongoErr}`);
+    }
 
-    // 1. Busca todas as empresas no MongoDB (apenas leitura find().toArray())
-    const entidades = await db.collection("entidades").find({}).toArray();
-
-    // 2. Busca registros no Firestore na collection 'monitored_tenants'
+    // 2. Busca registros no Firestore na collection 'monitored_tenants' (isolado)
     const monitoredMap = new Map<string, any>();
-
     try {
       const snapshot = await firestore.collection("monitored_tenants").get();
 
@@ -62,10 +73,13 @@ export async function GET(request: NextRequest) {
         `🔥 [Firestore] ${monitoredMap.size} entidade(s) monitorada(s) encontrada(s) na carteira deste analista.`
       );
     } catch (fsErr: any) {
-      console.warn(`⚠️ [Firestore] Falha ao ler 'monitored_tenants' (${fsErr.message}).`);
+      console.warn(
+        `⚠️ [Firestore Warning] Falha ao ler 'monitored_tenants' (${fsErr.message}). Retornando entidades do Mongo com isMonitored: false.`
+      );
     }
 
     // 3. Cruzamento em Memória (Node.js) com isolamento de carteira
+    // Se o Firestore falhou ou o mapa está vazio, todas as entidades são retornadas com isMonitored: false
     const resultado = entidades.map((doc) => {
       const idStr = doc._id ? doc._id.toString() : "";
       const monitoredData = monitoredMap.get(idStr);
@@ -106,12 +120,11 @@ export async function GET(request: NextRequest) {
       entidades: resultado,
     });
   } catch (error: any) {
-    console.error("❌ [/api/entidades] Erro:", error.message);
+    console.error('[API /api/entidades crash]:', error);
     return NextResponse.json(
-      {
-        success: false,
-        error: error.message,
-        entidades: [],
+      { 
+        error: error.message || 'Erro interno no servidor',
+        detail: String(error)
       },
       { status: 500 }
     );

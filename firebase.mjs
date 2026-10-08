@@ -2,37 +2,100 @@ import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import { readFileSync, existsSync } from "fs";
 
+let firestoreInstance = null;
+
+function parseServiceAccount(raw) {
+  let cleaned = raw.trim();
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'"))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) {
+    try {
+      const decoded = Buffer.from(cleaned, "base64").toString("utf8");
+      if (decoded.trim().startsWith("{")) {
+        cleaned = decoded.trim();
+      }
+    } catch {}
+  }
+  const parsed = JSON.parse(cleaned);
+  if (parsed.private_key && typeof parsed.private_key === "string") {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+  }
+  return parsed;
+}
+
 function getServiceAccount() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
     try {
-      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+      return parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
     } catch (err) {
-      console.error("❌ Falha ao fazer parse de FIREBASE_SERVICE_ACCOUNT_KEY:", err);
+      console.error("[Firebase Init Error]:", err.message || String(err));
     }
   }
 
   // Fallback local caso o arquivo exista em ambiente de desenvolvimento
-  const serviceAccountUrl = new URL("./firebase-service-account.json", import.meta.url);
-  if (existsSync(serviceAccountUrl)) {
-    return JSON.parse(readFileSync(serviceAccountUrl, "utf-8"));
+  try {
+    const serviceAccountUrl = new URL("./firebase-service-account.json", import.meta.url);
+    if (existsSync(serviceAccountUrl)) {
+      return parseServiceAccount(readFileSync(serviceAccountUrl, "utf-8"));
+    }
+  } catch (fsErr) {
+    console.error("[Firebase Init Error]: Falha ao ler arquivo local:", fsErr.message || String(fsErr));
   }
 
-  throw new Error(
-    "Nenhuma credencial do Firebase Admin encontrada (FIREBASE_SERVICE_ACCOUNT_KEY ou arquivo local)."
-  );
+  return null;
 }
 
-if (!getApps().length) {
-  const serviceAccount = getServiceAccount();
-  initializeApp({
-    credential: cert(serviceAccount),
-    projectId: serviceAccount.project_id,
-  });
-  console.log(`🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${serviceAccount.project_id}"`);
+try {
+  if (!getApps().length) {
+    const serviceAccount = getServiceAccount();
+    if (serviceAccount && (serviceAccount.project_id || serviceAccount.projectId)) {
+      const projId = serviceAccount.project_id || serviceAccount.projectId;
+      initializeApp({
+        credential: cert(serviceAccount),
+        projectId: projId,
+      });
+      console.log(`🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${projId}"`);
+    } else {
+      console.error(
+        "[Firebase Init Error]: Nenhuma credencial do Firebase Admin encontrada (FIREBASE_SERVICE_ACCOUNT_KEY ausente ou malformada e arquivo local inexistente)."
+      );
+    }
+  }
+
+  if (getApps().length > 0) {
+    try {
+      firestoreInstance = getFirestore("(default)");
+    } catch {
+      firestoreInstance = getFirestore();
+    }
+  }
+} catch (err) {
+  console.error("[Firebase Init Error]:", err.message || String(err));
 }
 
-// Inicialização explícita do Firestore com databaseId '(default)'
-export const firestore = getFirestore("(default)");
+// Proxy seguro para o Firestore
+export const firestore = new Proxy({}, {
+  get(target, prop, receiver) {
+    if (firestoreInstance) {
+      const val = Reflect.get(firestoreInstance, prop, receiver);
+      return typeof val === "function" ? val.bind(firestoreInstance) : val;
+    }
+    if (getApps().length > 0) {
+      try {
+        firestoreInstance = getFirestore("(default)");
+        const val = Reflect.get(firestoreInstance, prop, receiver);
+        return typeof val === "function" ? val.bind(firestoreInstance) : val;
+      } catch {}
+    }
+    throw new Error(
+      "Firebase Admin / Firestore não está inicializado. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
+    );
+  },
+});
 export const firestoreDb = firestore; // Alias retrocompatível
 
 /**

@@ -5,44 +5,133 @@ import fs from "fs";
 import path from "path";
 import { NextRequest } from "next/server";
 
-let firebaseApp: App;
+let firebaseApp: App | null = null;
+let firestoreInstance: Firestore | null = null;
+let adminAuthInstance: Auth | null = null;
 
-function getServiceAccount() {
+/**
+ * Normaliza e faz o parse da credencial do Firebase Admin de forma defensiva.
+ * Tolera aspas extras, quebras de linha escapadas e base64.
+ */
+function parseServiceAccount(raw: string): any {
+  let cleaned = raw.trim();
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'"))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) {
+    try {
+      const decoded = Buffer.from(cleaned, "base64").toString("utf8");
+      if (decoded.trim().startsWith("{")) {
+        cleaned = decoded.trim();
+      }
+    } catch {}
+  }
+  const parsed = JSON.parse(cleaned);
+  if (parsed.private_key && typeof parsed.private_key === "string") {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+  }
+  return parsed;
+}
+
+function getServiceAccount(): any | null {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
     try {
-      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-    } catch (err) {
-      console.error("❌ Falha ao fazer parse de FIREBASE_SERVICE_ACCOUNT_KEY:", err);
+      return parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+    } catch (err: any) {
+      console.error("[Firebase Init Error]:", err.message || String(err));
     }
   }
 
-  // Fallback local caso o arquivo exista em ambiente de desenvolvimento
-  const localPath = path.resolve(process.cwd(), "firebase-service-account.json");
-  if (fs.existsSync(localPath)) {
-    return JSON.parse(fs.readFileSync(localPath, "utf8"));
+  // Fallback local seguro (apenas se o arquivo físico existir)
+  try {
+    const localPath = path.resolve(process.cwd(), "firebase-service-account.json");
+    if (fs.existsSync(localPath)) {
+      const content = fs.readFileSync(localPath, "utf8");
+      return parseServiceAccount(content);
+    }
+  } catch (fsErr: any) {
+    console.error("[Firebase Init Error]: Falha ao ler arquivo local:", fsErr.message || String(fsErr));
   }
 
-  throw new Error(
-    "Nenhuma credencial do Firebase Admin encontrada (FIREBASE_SERVICE_ACCOUNT_KEY ou arquivo local)."
-  );
+  return null;
 }
 
-if (!getApps().length) {
-  const serviceAccount = getServiceAccount();
-  firebaseApp = initializeApp({
-    credential: cert(serviceAccount),
-    projectId: serviceAccount.project_id,
-  });
-  console.log(
-    `🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${serviceAccount.project_id}"`
-  );
-} else {
-  firebaseApp = getApps()[0];
+// Inicialização defensiva do Firebase Admin
+try {
+  if (!getApps().length) {
+    const serviceAccount = getServiceAccount();
+    if (serviceAccount && (serviceAccount.project_id || serviceAccount.projectId)) {
+      const projId = serviceAccount.project_id || serviceAccount.projectId;
+      firebaseApp = initializeApp({
+        credential: cert(serviceAccount),
+        projectId: projId,
+      });
+      console.log(
+        `🔥 [Firebase Admin] Inicializado com sucesso para o projeto: "${projId}"`
+      );
+    } else {
+      console.error(
+        "[Firebase Init Error]: Nenhuma credencial válida do Firebase Admin encontrada (FIREBASE_SERVICE_ACCOUNT_KEY ausente ou malformada e arquivo local inexistente)."
+      );
+    }
+  } else {
+    firebaseApp = getApps()[0];
+  }
+
+  if (firebaseApp) {
+    try {
+      firestoreInstance = getFirestore("(default)");
+    } catch {
+      firestoreInstance = getFirestore();
+    }
+    adminAuthInstance = getAuth(firebaseApp);
+  }
+} catch (err: any) {
+  console.error("[Firebase Init Error]:", err.message || String(err));
 }
 
-// Inicialização explícita do Firestore com databaseId '(default)'
-export const firestore: Firestore = getFirestore("(default)");
-export const adminAuth: Auth = getAuth(firebaseApp);
+// Proxy seguro para o Firestore: não quebra a carga do módulo se o Firebase não estiver inicializado
+export const firestore: Firestore = new Proxy({} as Firestore, {
+  get(target, prop, receiver) {
+    if (firestoreInstance) {
+      const val = Reflect.get(firestoreInstance, prop, receiver);
+      return typeof val === "function" ? val.bind(firestoreInstance) : val;
+    }
+    if (getApps().length > 0) {
+      try {
+        firestoreInstance = getFirestore("(default)");
+        const val = Reflect.get(firestoreInstance, prop, receiver);
+        return typeof val === "function" ? val.bind(firestoreInstance) : val;
+      } catch {}
+    }
+    throw new Error(
+      "Firebase Admin / Firestore não está inicializado. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
+    );
+  },
+});
+
+// Proxy seguro para Auth
+export const adminAuth: Auth = new Proxy({} as Auth, {
+  get(target, prop, receiver) {
+    if (adminAuthInstance) {
+      const val = Reflect.get(adminAuthInstance, prop, receiver);
+      return typeof val === "function" ? val.bind(adminAuthInstance) : val;
+    }
+    if (getApps().length > 0) {
+      try {
+        adminAuthInstance = getAuth(getApps()[0]);
+        const val = Reflect.get(adminAuthInstance, prop, receiver);
+        return typeof val === "function" ? val.bind(adminAuthInstance) : val;
+      } catch {}
+    }
+    throw new Error(
+      "Firebase Admin Auth não está inicializado. Verifique a variável FIREBASE_SERVICE_ACCOUNT_KEY."
+    );
+  },
+});
 
 export function getAdminFirestore(): Firestore {
   return firestore;

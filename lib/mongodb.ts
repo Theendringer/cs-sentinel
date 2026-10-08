@@ -1,31 +1,40 @@
 import { MongoClient, Db, ObjectId } from "mongodb";
 
-const uri = process.env.MONGODB_URI || "mongodb://localhost:27017";
-const dbName = process.env.MONGODB_DB_NAME || "hackathon_db";
-
-let client: MongoClient | null = null;
-let clientPromise: Promise<MongoClient>;
+const defaultDbName = "hackathon_db";
 
 declare global {
   var _mongoClientPromise: Promise<MongoClient> | undefined;
 }
 
-if (process.env.NODE_ENV === "development") {
+/**
+ * Obtém ou inicializa a Promise de conexão do MongoClient com cache global.
+ */
+function getClientPromise(): Promise<MongoClient> {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error(
+      "Variável de ambiente MONGODB_URI não configurada no servidor. Configure MONGODB_URI nas variáveis da Vercel."
+    );
+  }
+
   if (!global._mongoClientPromise) {
-    client = new MongoClient(uri);
+    const client = new MongoClient(uri, {
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 8000,
+      connectTimeoutMS: 10000,
+    });
     global._mongoClientPromise = client.connect();
   }
-  clientPromise = global._mongoClientPromise;
-} else {
-  client = new MongoClient(uri);
-  clientPromise = client.connect();
+
+  return global._mongoClientPromise;
 }
 
 /**
  * Obtém a instância conectada do banco de dados MongoDB
  */
 export async function getMongoDb(): Promise<Db> {
-  const connectedClient = await clientPromise;
+  const dbName = process.env.MONGODB_DB_NAME || defaultDbName;
+  const connectedClient = await getClientPromise();
   return connectedClient.db(dbName);
 }
 
