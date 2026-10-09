@@ -240,6 +240,11 @@ export default function DashboardPage() {
   const [emailPreviewHtml, setEmailPreviewHtml] = useState<string | null>(null);
   const [showEmailPreviewModal, setShowEmailPreviewModal] = useState(false);
 
+  // Estado do Botão de Teste Manual de Monitoramento Ativo
+  const [runningMonitorCheck, setRunningMonitorCheck] = useState(false);
+  const [monitorExecutionModalOpen, setMonitorExecutionModalOpen] = useState(false);
+  const [monitorExecutionData, setMonitorExecutionData] = useState<any>(null);
+
   // Usuário CS logado
   const [currentUser, setCurrentUser] = useState<{
     uid: string;
@@ -890,6 +895,65 @@ export default function DashboardPage() {
     } finally {
       setSendingTestEmail(false);
       setTimeout(() => setToastMessage(null), 5000);
+    }
+  };
+
+  // Disparo manual imediato da verificação de monitoramento ativo com IA e envio de e-mail
+  const handleTriggerMonitorAndEmailNow = async () => {
+    setRunningMonitorCheck(true);
+    setToastMessage({
+      text: "Iniciando varredura ativa das suas contas no MongoDB e Firestore...",
+      type: "warning",
+    });
+
+    try {
+      const authCtx = await getAuthContext();
+      const res = await fetch(`/api/cron/monitor?${authCtx.queryParams}&manual=true`, {
+        method: "POST",
+        headers: authCtx.headers,
+        body: JSON.stringify({
+          isManualTest: true,
+          csUid: authCtx.uid,
+          csEmail: authCtx.email,
+          csName: authCtx.name,
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Falha na requisição: HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      if (!data.success) {
+        throw new Error(data.error || "Falha na execução do monitoramento.");
+      }
+
+      setMonitorExecutionData(data);
+      setMonitorExecutionModalOpen(true);
+
+      const incidentesCount = data.totalIncidentes ?? 0;
+      const emailsCount = data.emailsDisparados ?? 0;
+      const recipient = authCtx.email || currentUser?.email;
+
+      setToastMessage({
+        text: `✅ Varredura concluída! ${incidentesCount} anomalia(s) avaliada(s). Relatório enviado para ${recipient}!`,
+        type: "success",
+      });
+
+      // Recarrega os dados atualizados das contas e histórico de alertas
+      fetchData();
+      if (selectedTenantId) {
+        handleSelectTenant(selectedTenantId);
+      }
+    } catch (err: any) {
+      console.error("Erro ao disparar verificação e e-mail imediato:", err);
+      setToastMessage({
+        text: `Erro ao disparar verificação: ${err.message}`,
+        type: "error",
+      });
+    } finally {
+      setRunningMonitorCheck(false);
+      setTimeout(() => setToastMessage(null), 7000);
     }
   };
 
@@ -1566,19 +1630,34 @@ export default function DashboardPage() {
               <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin text-[#1D00EB]" : ""}`} />
             </button>
 
-            {/* Botão Secundário: Disparar E-mail de Teste */}
+            {/* Botão Oficial Requisitado: Disparar Verificação e E-mail Agora */}
+            <button
+              onClick={handleTriggerMonitorAndEmailNow}
+              disabled={runningMonitorCheck}
+              title={`Forçar verificação ativa das contas e enviar e-mail agora para ${currentUser?.email || "seu e-mail"}`}
+              className="flex items-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 px-3.5 py-2 text-xs font-semibold text-white shadow-card-sm transition disabled:opacity-50"
+            >
+              {runningMonitorCheck ? (
+                <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+              ) : (
+                <Mail className="h-4 w-4 text-emerald-100" />
+              )}
+              <span>Disparar Verificação e E-mail Agora</span>
+            </button>
+
+            {/* Botão Secundário: Disparar E-mail de Demonstração */}
             <button
               onClick={handleSendTestEmail}
               disabled={sendingTestEmail}
-              title={`Disparar e-mail de demonstração para ${currentUser?.email || "seu e-mail"}`}
-              className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300 px-3.5 py-2 text-xs font-semibold text-slate-700 shadow-sm transition disabled:opacity-50"
+              title={`Disparar e-mail de demonstração isolado para ${currentUser?.email || "seu e-mail"}`}
+              className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 hover:border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 shadow-sm transition disabled:opacity-50"
             >
               {sendingTestEmail ? (
                 <div className="h-4 w-4 animate-spin rounded-full border-2 border-[#1D00EB] border-t-transparent" />
               ) : (
-                <Mail className="h-4 w-4 text-[#1D00EB]" />
+                <Mail className="h-4 w-4 text-slate-500" />
               )}
-              <span>Disparar E-mail de Teste</span>
+              <span className="hidden xl:inline">E-mail Demo</span>
             </button>
 
             {emailPreviewHtml && (
@@ -3280,6 +3359,90 @@ export default function DashboardPage() {
                 className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition"
               >
                 Fechar Prévia
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================ */}
+      {/* MODAL DE RESULTADO: MONITORAMENTO ATIVO E E-MAIL DISPARADO   */}
+      {/* ============================================================ */}
+      {monitorExecutionModalOpen && monitorExecutionData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 animate-in fade-in duration-150">
+          <div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl border border-slate-100 overflow-hidden flex flex-col">
+            <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4 bg-slate-50/70">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-100 text-emerald-800">
+                  <Mail className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">
+                    Ciclo de Monitoramento Ativo Concluído
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium">
+                    Relatório consolidado e disparado para {currentUser?.email || "seu e-mail"}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMonitorExecutionModalOpen(false)}
+                className="rounded-lg p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700 transition"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              {/* Resumo em cards */}
+              <div className="grid grid-cols-3 gap-3">
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-center">
+                  <span className="block text-[10px] font-bold uppercase text-slate-400">Contas Auditadas</span>
+                  <strong className="text-lg text-slate-900">{monitorExecutionData.totalTenants ?? 0}</strong>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-center">
+                  <span className="block text-[10px] font-bold uppercase text-slate-400">Anomalias / Incidentes</span>
+                  <strong className={`text-lg ${(monitorExecutionData.totalIncidentes ?? 0) > 0 ? "text-rose-600" : "text-emerald-600"}`}>
+                    {monitorExecutionData.totalIncidentes ?? 0}
+                  </strong>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-center">
+                  <span className="block text-[10px] font-bold uppercase text-slate-400">Envio de E-mail</span>
+                  <strong className="text-sm text-emerald-700">
+                    {monitorExecutionData.resultsByCS?.[0]?.emailStatus === "simulado"
+                      ? "Simulado (Dev)"
+                      : monitorExecutionData.resultsByCS?.[0]?.emailStatus === "enviado"
+                      ? "Entregue (Gmail)"
+                      : "Verificado"}
+                  </strong>
+                </div>
+              </div>
+
+              {/* Mensagem descritiva */}
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 text-xs text-emerald-950 leading-relaxed">
+                <p className="font-semibold mb-1">
+                  ✉️ Notificação enviada para: <span className="underline">{currentUser?.email}</span>
+                </p>
+                <p className="text-emerald-800">
+                  O Sentinel CS executou a varredura completa das integrações pendentes no MongoDB e filtros de snooze no Firestore. O diagnóstico da IA e os roteiros de abordagem preventiva foram entregues na sua caixa de entrada.
+                </p>
+              </div>
+
+              {/* Detalhes de execução */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-[11px] font-mono text-slate-600 flex justify-between">
+                <span>Duração da análise: {((monitorExecutionData.durationMs || 0) / 1000).toFixed(2)}s</span>
+                <span>Horário: {new Date(monitorExecutionData.executedAt || Date.now()).toLocaleTimeString("pt-BR")}</span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 border-t border-slate-100 bg-slate-50/70 px-6 py-4">
+              <button
+                type="button"
+                onClick={() => setMonitorExecutionModalOpen(false)}
+                className="rounded-xl bg-slate-900 px-5 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition"
+              >
+                Concluir
               </button>
             </div>
           </div>
