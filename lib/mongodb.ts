@@ -1,4 +1,5 @@
 import { MongoClient, Db, ObjectId } from "mongodb";
+import type { GrupoMonitoramento } from "./firebase-admin";
 
 const defaultDbName = "hackathon_db";
 
@@ -49,6 +50,19 @@ export interface ErroGrupoResumo {
   detalheRequisicao?: any;
 }
 
+export interface AvaliacaoGrupoMonitoramento {
+  id: string;
+  nome: string;
+  tipos: string[];
+  limiteErros: number;
+  janelaValor: number;
+  janelaUnidade: "horas" | "dias";
+  totalErros: number;
+  violouSLA: boolean;
+  amostraCodigos: string[];
+  amostraMensagens: string[];
+}
+
 export interface TenantHealthResult {
   entidadeId: string;
   nomeEntidade: string;
@@ -61,9 +75,24 @@ export interface TenantHealthResult {
     ultimoAcesso: string;
     diasSemAcesso: number | string;
   }>;
+  ultimoAcessoGeral?: {
+    data: string | null;
+    usuarioNome: string | null;
+    usuarioEmail: string | null;
+    diasSemAcesso: number | null;
+    tempoRelativo: string;
+  };
+  ultimoAcessoMaisRecente?: {
+    data: string | null;
+    usuarioNome: string | null;
+    usuarioEmail: string | null;
+    diasSemAcesso: number | null;
+    tempoRelativo: string;
+  };
   errosRecentesUltimas2h: number;
   amostraErros: string[];
   gruposErros?: ErroGrupoResumo[];
+  avaliacaoGrupos?: AvaliacaoGrupoMonitoramento[];
   tiposMonitoradosFiltrados?: string[];
   periodoDiasAnalise: number;
 }
@@ -91,7 +120,8 @@ function buildTipoIntegracaoRegex(tipo: string): RegExp[] {
 export async function checkTenantHealthMetrics(
   entidadeId: string,
   diasSemAcesso: number = 7,
-  tiposMonitorados?: string[]
+  tiposMonitorados?: string[],
+  gruposMonitoramento?: GrupoMonitoramento[]
 ): Promise<TenantHealthResult | { error: string }> {
   try {
     const db = await getMongoDb();
@@ -119,9 +149,18 @@ export async function checkTenantHealthMetrics(
 
     const ativos: any[] = [];
     const inativos: any[] = [];
+    let usuarioMaisRecente: any = null;
+    let dataAcessoMaisRecente: Date | null = null;
 
     for (const u of usuarios) {
       const dataAcesso = u.ultimoAcesso ? new Date(u.ultimoAcesso) : null;
+      if (dataAcesso && !isNaN(dataAcesso.getTime())) {
+        if (!dataAcessoMaisRecente || dataAcesso > dataAcessoMaisRecente) {
+          dataAcessoMaisRecente = dataAcesso;
+          usuarioMaisRecente = u;
+        }
+      }
+
       const isAtivo = dataAcesso && dataAcesso >= limiteInatividade;
 
       if (isAtivo) {
@@ -139,6 +178,31 @@ export async function checkTenantHealthMetrics(
         });
       }
     }
+
+    const diasDesdeUltimoAcessoGlobal = dataAcessoMaisRecente
+      ? Math.max(0, Math.floor((agora - dataAcessoMaisRecente.getTime()) / (1000 * 60 * 60 * 24)))
+      : null;
+
+    let tempoRelativo = "Nenhum acesso registrado";
+    if (diasDesdeUltimoAcessoGlobal !== null) {
+      if (diasDesdeUltimoAcessoGlobal === 0) {
+        tempoRelativo = "Hoje";
+      } else if (diasDesdeUltimoAcessoGlobal === 1) {
+        tempoRelativo = "Há 1 dia";
+      } else if (diasDesdeUltimoAcessoGlobal > limiteDias) {
+        tempoRelativo = `Sem acessos há ${diasDesdeUltimoAcessoGlobal} dias`;
+      } else {
+        tempoRelativo = `Há ${diasDesdeUltimoAcessoGlobal} dias`;
+      }
+    }
+
+    const ultimoAcessoGeral = {
+      data: dataAcessoMaisRecente ? dataAcessoMaisRecente.toISOString() : null,
+      usuarioNome: usuarioMaisRecente?.nome || null,
+      usuarioEmail: usuarioMaisRecente?.email || null,
+      diasSemAcesso: diasDesdeUltimoAcessoGlobal,
+      tempoRelativo,
+    };
 
     // 3. Consulta de Erros na collection 'errosintegracoes' (Read-Only)
     const errorQuery: any = {
@@ -285,6 +349,89 @@ export async function checkTenantHealthMetrics(
         .map((e) => e.mensagem || e.status || e.error || "Erro registrado");
     }
 
+    // 4. Avaliação individualizada de Grupos Customizados de Monitoramento
+    const avaliacaoGrupos: AvaliacaoGrupoMonitoramento[] = [];
+    const gruposParaAvaliar: GrupoMonitoramento[] =
+      Array.isArray(gruposMonitoramento) && gruposMonitoramento.length > 0
+        ? gruposMonitoramento
+        : [
+            {
+              id: "grupo_default",
+              nome: "Geral",
+              tipos: tiposAtivos,
+              limiteErros: 5,
+              janelaValor: 2,
+              janelaUnidade: "horas",
+            },
+          ];
+
+    for (const g of gruposParaAvaliar) {
+      const janelaHoras = g.janelaUnidade === "dias" ? (Number(g.janelaValor) || 1) * 24 : (Number(g.janelaValor) || 2);
+      const dataCorte = new Date(agora - janelaHoras * 60 * 60 * 1000);
+
+      const gQuery: any = {
+        entidade: targetObjectId,
+        status: "pendente",
+        $or: [
+          { dataCriacao: { $gte: dataCorte } },
+          { ultimaAtualizacao: { $gte: dataCorte } },
+          { dataCriacao: { $gte: dataCorte.toISOString() } },
+          { ultimaAtualizacao: { $gte: dataCorte.toISOString() } },
+        ],
+      };
+
+      if (Array.isArray(g.tipos) && g.tipos.length > 0) {
+        const rList = g.tipos.flatMap(buildTipoIntegracaoRegex);
+        gQuery.tipoIntegracao = { $in: rList };
+      }
+
+      const docsDoGrupo = await db
+        .collection("errosintegracoes")
+        .find(gQuery, { projection })
+        .sort({ dataCriacao: -1, ultimaAtualizacao: -1 })
+        .limit(100)
+        .toArray();
+
+      const totalErrosG = docsDoGrupo.length;
+      const violouSLA = totalErrosG > g.limiteErros;
+      const amostraCodigosSet = new Set<string>();
+      const amostraMensagensSet = new Set<string>();
+
+      for (const d of docsDoGrupo) {
+        if (d.codigoRegistro && amostraCodigosSet.size < 5) {
+          amostraCodigosSet.add(String(d.codigoRegistro));
+        }
+        if (Array.isArray(d.mensagens)) {
+          for (const m of d.mensagens) {
+            const txt = typeof m === "string" ? m : m?.texto;
+            if (txt && amostraMensagensSet.size < 3) {
+              amostraMensagensSet.add(String(txt).trim());
+            }
+          }
+        }
+        if (amostraMensagensSet.size < 3 && d.requisicao?.retorno?.data) {
+          const retStr =
+            typeof d.requisicao.retorno.data === "string"
+              ? d.requisicao.retorno.data
+              : JSON.stringify(d.requisicao.retorno.data).slice(0, 160);
+          amostraMensagensSet.add(retStr);
+        }
+      }
+
+      avaliacaoGrupos.push({
+        id: g.id,
+        nome: g.nome,
+        tipos: g.tipos || [],
+        limiteErros: g.limiteErros,
+        janelaValor: g.janelaValor,
+        janelaUnidade: g.janelaUnidade,
+        totalErros: totalErrosG,
+        violouSLA,
+        amostraCodigos: Array.from(amostraCodigosSet),
+        amostraMensagens: Array.from(amostraMensagensSet),
+      });
+    }
+
     return {
       entidadeId,
       nomeEntidade,
@@ -292,9 +439,12 @@ export async function checkTenantHealthMetrics(
       usuariosAtivosNoPeriodo: ativos.length,
       totalUsuariosInativos: inativos.length,
       usuariosInativos: inativos.slice(0, 5),
+      ultimoAcessoGeral,
+      ultimoAcessoMaisRecente: ultimoAcessoGeral,
       errosRecentesUltimas2h: totalErros2h,
       amostraErros: mensagensErros,
       gruposErros,
+      avaliacaoGrupos,
       tiposMonitoradosFiltrados: tiposAtivos,
       periodoDiasAnalise: limiteDias,
     };

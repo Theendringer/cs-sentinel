@@ -82,7 +82,7 @@ function buildTipoIntegracaoRegex(tipo) {
  * - Erros recentes nas últimas 2 horas na collection 'errosintegracoes' (Read-Only)
  * - Agrupamento em memória por layoutIntegracao + tipoIntegracao para análise contextual da IA
  */
-async function checkTenantHealth({ entidadeId, diasSemAcesso = 7, tiposMonitorados }) {
+async function checkTenantHealth({ entidadeId, diasSemAcesso = 7, tiposMonitorados, gruposMonitoramento }) {
   console.log(`\n📊 [Tool Call: checkTenantHealth] Auditando telemetria no MongoDB para entidadeId: "${entidadeId}"...`);
 
   if (!entidadeId) {
@@ -112,9 +112,18 @@ async function checkTenantHealth({ entidadeId, diasSemAcesso = 7, tiposMonitorad
 
   const usuariosAtivos = [];
   const usuariosInativos = [];
+  let usuarioMaisRecente = null;
+  let dataAcessoMaisRecente = null;
 
   for (const user of usuarios) {
     const dataAcesso = user.ultimoAcesso ? new Date(user.ultimoAcesso) : null;
+    if (dataAcesso && !isNaN(dataAcesso.getTime())) {
+      if (!dataAcessoMaisRecente || dataAcesso > dataAcessoMaisRecente) {
+        dataAcessoMaisRecente = dataAcesso;
+        usuarioMaisRecente = user;
+      }
+    }
+
     const isAtivo = dataAcesso && dataAcesso >= limiteInatividade;
 
     if (isAtivo) {
@@ -136,6 +145,31 @@ async function checkTenantHealth({ entidadeId, diasSemAcesso = 7, tiposMonitorad
       });
     }
   }
+
+  const diasDesdeUltimoAcessoGlobal = dataAcessoMaisRecente
+    ? Math.max(0, Math.floor((agora - dataAcessoMaisRecente.getTime()) / (1000 * 60 * 60 * 24)))
+    : null;
+
+  let tempoRelativo = "Nenhum acesso registrado";
+  if (diasDesdeUltimoAcessoGlobal !== null) {
+    if (diasDesdeUltimoAcessoGlobal === 0) {
+      tempoRelativo = "Hoje";
+    } else if (diasDesdeUltimoAcessoGlobal === 1) {
+      tempoRelativo = "Há 1 dia";
+    } else if (diasDesdeUltimoAcessoGlobal > limiteDias) {
+      tempoRelativo = `Sem acessos há ${diasDesdeUltimoAcessoGlobal} dias`;
+    } else {
+      tempoRelativo = `Há ${diasDesdeUltimoAcessoGlobal} dias`;
+    }
+  }
+
+  const ultimoAcessoGeral = {
+    data: dataAcessoMaisRecente ? dataAcessoMaisRecente.toISOString() : null,
+    usuarioNome: usuarioMaisRecente ? (usuarioMaisRecente.nome || "Usuário") : null,
+    usuarioEmail: usuarioMaisRecente ? (usuarioMaisRecente.email || null) : null,
+    diasSemAcesso: diasDesdeUltimoAcessoGlobal,
+    tempoRelativo,
+  };
 
   // 3. Consulta de Erros nas últimas 2 horas (Collection: errosintegracoes - Read-Only)
   const queryErros = {
@@ -263,6 +297,90 @@ async function checkTenantHealth({ entidadeId, diasSemAcesso = 7, tiposMonitorad
       .map((e) => e.mensagem || e.status || e.error || "Erro registrado sem detalhe");
   }
 
+  // 4. Avaliação individualizada de Grupos Customizados de Monitoramento
+  const avaliacaoGrupos = [];
+  const gruposParaAvaliar = Array.isArray(gruposMonitoramento) && gruposMonitoramento.length > 0
+    ? gruposMonitoramento
+    : [
+        {
+          id: "grupo_default",
+          nome: "Geral",
+          tipos: tiposAtivos,
+          limiteErros: 5,
+          janelaValor: 2,
+          janelaUnidade: "horas",
+        },
+      ];
+
+  for (const g of gruposParaAvaliar) {
+    const janelaHoras = g.janelaUnidade === "dias" ? (Number(g.janelaValor) || 1) * 24 : (Number(g.janelaValor) || 2);
+    const dataCorte = new Date(agora - janelaHoras * 60 * 60 * 1000);
+
+    const gQuery = {
+      entidade: targetObjectId,
+      status: "pendente",
+      $or: [
+        { dataCriacao: { $gte: dataCorte } },
+        { ultimaAtualizacao: { $gte: dataCorte } },
+        { dataCriacao: { $gte: dataCorte.toISOString() } },
+        { ultimaAtualizacao: { $gte: dataCorte.toISOString() } },
+      ],
+    };
+
+    if (Array.isArray(g.tipos) && g.tipos.length > 0) {
+      const rList = g.tipos.flatMap(buildTipoIntegracaoRegex);
+      gQuery.tipoIntegracao = { $in: rList };
+    }
+
+    const docsDoGrupo = await db
+      .collection("errosintegracoes")
+      .find(gQuery, { projection })
+      .sort({ dataCriacao: -1, ultimaAtualizacao: -1 })
+      .limit(100)
+      .toArray();
+
+    const totalErrosG = docsDoGrupo.length;
+    const violouSLA = totalErrosG > g.limiteErros;
+    const amostraCodigosSet = new Set();
+    const amostraMensagensSet = new Set();
+
+    for (const d of docsDoGrupo) {
+      if (d.codigoRegistro && amostraCodigosSet.size < 5) {
+        amostraCodigosSet.add(String(d.codigoRegistro));
+      }
+      if (Array.isArray(d.mensagens)) {
+        for (const m of d.mensagens) {
+          const txt = typeof m === "string" ? m : m?.texto;
+          if (txt && amostraMensagensSet.size < 3) {
+            amostraMensagensSet.add(String(txt).trim());
+          }
+        }
+      }
+      if (amostraMensagensSet.size < 3 && d.requisicao?.retorno?.data) {
+        const retStr =
+          typeof d.requisicao.retorno.data === "string"
+            ? d.requisicao.retorno.data
+            : JSON.stringify(d.requisicao.retorno.data).slice(0, 160);
+        amostraMensagensSet.add(retStr);
+      }
+    }
+
+    avaliacaoGrupos.push({
+      id: g.id,
+      nome: g.nome,
+      tipos: g.tipos || [],
+      limiteErros: g.limiteErros,
+      janelaValor: g.janelaValor,
+      janelaUnidade: g.janelaUnidade,
+      totalErros: totalErrosG,
+      violouSLA,
+      amostraCodigos: Array.from(amostraCodigosSet),
+      amostraMensagens: Array.from(amostraMensagensSet),
+    });
+  }
+
+  const gruposComSlaViolado = avaliacaoGrupos.filter((g) => g.violouSLA);
+
   const resultadoSaude = {
     entidadeId,
     nomeEntidade,
@@ -270,6 +388,8 @@ async function checkTenantHealth({ entidadeId, diasSemAcesso = 7, tiposMonitorad
       inatividadeEmDias: limiteDias,
       errosEmHoras: 2,
     },
+    ultimoAcessoGeral,
+    ultimoAcessoMaisRecente: ultimoAcessoGeral,
     usuarios: {
       totalCadastrados: totalUsuariosCadastrados,
       ativosNoPeriodo: usuariosAtivos.length,
@@ -282,10 +402,12 @@ async function checkTenantHealth({ entidadeId, diasSemAcesso = 7, tiposMonitorad
       gruposErros,
       tiposMonitoradosFiltrados: tiposAtivos,
     },
+    avaliacaoGrupos,
+    gruposComSlaViolado,
   };
 
   console.log(
-    `📈 [Tool Result: checkTenantHealth] "${nomeEntidade}": ${totalErrosUltimas2h} erros (2h) | Grupos: ${gruposErros.length} | ${usuariosAtivos.length}/${totalUsuariosCadastrados} ativos (${limiteDias}d)`
+    `📈 [Tool Result: checkTenantHealth] "${nomeEntidade}": ${totalErrosUltimas2h} erros (2h) | Grupos Customizados: ${avaliacaoGrupos.length} (${gruposComSlaViolado.length} SLA violado) | ${usuariosAtivos.length}/${totalUsuariosCadastrados} ativos (${limiteDias}d)`
   );
 
   return resultadoSaude;
@@ -424,6 +546,12 @@ const toolsDeclarations = [
               description:
                 "Lista de tipos de integração configurados no threshold da entidade para filtrar os erros (ex: ['anuncio', 'pedido', 'estoque']). Se vazio ou omitido, audita todos os tipos.",
             },
+            gruposMonitoramento: {
+              type: SchemaType.ARRAY,
+              items: { type: SchemaType.OBJECT },
+              description:
+                "Array de grupos de monitoramento customizados com limites e janelas independentes (ex: [{ id, nome, tipos, limiteErros, janelaValor, janelaUnidade }]).",
+            },
           },
           required: ["entidadeId"],
         },
@@ -545,30 +673,34 @@ DIRETRIZ CENTRAL DE ATUAÇÃO (FOCO EM CS E NEGÓCIO):
 FLUXO OPERACIONAL OBRIGATÓRIO:
 1. Comece chamando a ferramenta 'getMonitoredTenants()' para obter as empresas cadastradas no Firestore pelo time de CS.
 2. Para CADA entidade retornada:
-   - Extraia o 'entidadeId', 'nome', os dados do CS responsável ('assignedCS') e os 'thresholds' (incluindo 'maxErros2h', 'diasSemAcessoAlerta' e 'tiposMonitorados').
+   - Extraia o 'entidadeId', 'nome', os dados do CS responsável ('assignedCS') e os 'thresholds' (incluindo 'gruposMonitoramento', 'maxErros2h', 'diasSemAcessoAlerta' e 'tiposMonitorados').
    - Execute a ferramenta 'checkTenantHealth' passando:
      * 'entidadeId': o ID da entidade no MongoDB.
      * 'diasSemAcesso': valor de diasSemAcessoAlerta (padrão 7).
-     * 'tiposMonitorados': o array thresholds.tiposMonitorados configurado para a entidade (se não houver tipos selecionados, passe vazio ou omita para monitorar todos).
+     * 'tiposMonitorados': o array thresholds.tiposMonitorados configurado para a entidade.
+     * 'gruposMonitoramento': o array thresholds.gruposMonitoramento com os grupos customizados de regras.
 3. AVALIAÇÃO DE RISCO E DISPARO DE ALERTAS:
-   - REGRA 1 (Instabilidade Operacional / Erros em Integrações):
-     Se a contagem de erros recentes nas últimas 2h (errosRecentes2h) for maior que 'thresholds.maxErros2h' (ou se houver grupo crítico de erros com padrões repetitivos):
+   - REGRA 1 (Instabilidade Operacional / Erros em Grupos de Integração):
+     Se houver violação de SLA em algum dos grupos customizados ('gruposComSlaViolado'), ou se a contagem de erros recentes nas últimas 2h for maior que 'thresholds.maxErros2h':
      Dispare IMEDIATAMENTE a ferramenta 'sendCSAlert' com:
        - tipoRisco: 'RISCO OPERACIONAL DE INTEGRAÇÃO'
-       - motivo: Diagnóstico executivo identificando o canal (layoutIntegracao, ex: VTEX), o tipo de integração (tipoIntegracao, ex: anúncio), volume de itens afetados e o padrão da mensagem principal.
+       - motivo: Diagnóstico executivo indicando qual grupo de regras foi violado (ex: 'Operação de Pedidos'), canal (layoutIntegracao), tipo de integração, volume de itens afetados e o padrão da mensagem principal.
        - acaoRecomendada:
-         * Impacto Comercial: Explicação em linguagem de negócios sobre o prejuízo ou travamento das vendas do cliente.
-         * Roteiro Prescritivo de Contato: Mensagem pronta para o CS abordar o cliente proativamente (ex: "Olá [Cliente], identificamos preventivamente que X anúncios na VTEX estão pausados por inconsistência de EAN...").
+         * Impacto Comercial: Explicação em linguagem de negócios sobre o prejuízo ou travamento das vendas do cliente, calibrado pelo peso do grupo violado (ex.: Pedidos = urgência crítica imediata; Anúncios = acompanhamento regular).
+         * Roteiro Prescritivo de Contato: Mensagem pronta para o CS abordar o cliente proativamente (ex: "Olá [Cliente], identificamos preventivamente que X pedidos na VTEX falharam...").
    
    - REGRA 2 (Risco de Churn / Desengajamento):
-     Se 'usuariosAtivosNoPeriodo == 0' ou adesão drasticamente baixa nos últimos dias:
+     A conta é considerada Ativa/Saudável se pelo menos 1 usuário daquela entidade tiver realizado login dentro do período tolerado ('diasSemAcessoAlerta').
+     Só classifique como 'RISCO DE CHURN / DESENGAJAMENTO' por inatividade se NENHUM usuário da entidade tiver logado nos últimos X dias ('usuarios.ativosNoPeriodo == 0', ou seja, se a data do último login geral da empresa 'ultimoAcessoGeral' for superior ao limite configurado ou se nenhum usuário jamais acessou).
+     Não exija que todos ou uma porcentagem fixa de usuários estejam acessando: se pelo menos 1 usuário estiver ativo no período tolerado, a conta NÃO tem risco de churn por inatividade.
+     Quando NENHUM usuário tiver acessado no período:
      Dispare IMEDIATAMENTE a ferramenta 'sendCSAlert' com:
        - tipoRisco: 'RISCO DE CHURN / DESENGAJAMENTO'
-       - motivo: Inatividade identificada no período.
-       - acaoRecomendada: Roteiro empático de reengajamento para o CS agendar reunião de alinhamento de valor.
+       - motivo: Inatividade geral identificada na conta (informando há quantos dias a conta está sem nenhum acesso e quem foi o último usuário a logar, se houver).
+       - acaoRecomendada: Roteiro empático de reengajamento para o CS agendar reunião com os pontos focais da empresa.
    
    - REGRA 3 (Cliente Saudável):
-     Se a entidade não violar os limites operacionais e apresentar engajamento adequado:
+     Se a entidade não violar os limites operacionais e apresentar engajamento adequado (pelo menos 1 usuário ativo no período, 'usuarios.ativosNoPeriodo >= 1'):
      Execute a ferramenta 'resolveTenantAlerts' passando 'entidadeId' para marcar alertas anteriores pendentes como 'resolvido' no Firestore.
      Registre como saudável para o relatório final.
 

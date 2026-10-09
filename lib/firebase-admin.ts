@@ -142,6 +142,24 @@ export interface CSUserFilter {
   name?: string;
 }
 
+export interface GrupoMonitoramento {
+  id: string;
+  nome: string; // ex: 'Operação de Pedidos', 'Catálogo e Anúncios'
+  tipos: string[]; // ex: ['Pedido', 'Pedido Faturado', 'Pedido Liberado']
+  limiteErros: number; // ex: 5
+  janelaValor: number; // ex: 2, 6, 12, 24 ou 1, 2, 7
+  janelaUnidade: "horas" | "dias"; // unidade de tempo
+}
+
+export interface IncidentFeedbackItem {
+  observacao: string;
+  silenciadoAte?: string | null; // ISO string
+  atualizadoPor: string;
+  atualizadoEm: string; // ISO string
+}
+
+export type IncidentFeedbackMap = Record<string, IncidentFeedbackItem>;
+
 export interface MonitoredTenant {
   entidadeId: string;
   nome: string;
@@ -153,9 +171,11 @@ export interface MonitoredTenant {
   };
   thresholds: {
     diasSemAcessoAlerta: number;
-    maxErros2h: number;
+    maxErros2h?: number;
     tiposMonitorados?: string[];
+    gruposMonitoramento?: GrupoMonitoramento[];
   };
+  incidentFeedback?: IncidentFeedbackMap;
   updatedAt?: string;
 }
 
@@ -332,7 +352,18 @@ export async function getActiveMonitoredTenants(
           tiposMonitorados: Array.isArray(data.thresholds?.tiposMonitorados)
             ? data.thresholds.tiposMonitorados
             : [],
+          gruposMonitoramento: Array.isArray(data.thresholds?.gruposMonitoramento)
+            ? data.thresholds.gruposMonitoramento.map((g: any) => ({
+                id: String(g.id || `grupo_${Date.now()}`),
+                nome: String(g.nome || "Geral"),
+                tipos: Array.isArray(g.tipos) ? g.tipos.map(String) : [],
+                limiteErros: Number(g.limiteErros ?? 5),
+                janelaValor: Number(g.janelaValor ?? 2),
+                janelaUnidade: (g.janelaUnidade === "dias" ? "dias" : "horas") as "horas" | "dias",
+              }))
+            : [],
         },
+        incidentFeedback: (data.incidentFeedback || {}) as IncidentFeedbackMap,
         updatedAt: data.updatedAt,
       });
     });
@@ -402,6 +433,16 @@ export async function upsertMonitoredTenants(
           tiposMonitorados: Array.isArray(tenant.thresholds?.tiposMonitorados)
             ? tenant.thresholds.tiposMonitorados
             : [],
+          gruposMonitoramento: Array.isArray(tenant.thresholds?.gruposMonitoramento)
+            ? tenant.thresholds.gruposMonitoramento.map((g: any) => ({
+                id: String(g.id || `grupo_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`),
+                nome: String(g.nome || "Geral"),
+                tipos: Array.isArray(g.tipos) ? g.tipos.map(String) : [],
+                limiteErros: Number(g.limiteErros ?? 5),
+                janelaValor: Number(g.janelaValor ?? 2),
+                janelaUnidade: (g.janelaUnidade === "dias" ? "dias" : "horas") as "horas" | "dias",
+              }))
+            : [],
         },
         updatedAt: new Date().toISOString(),
       };
@@ -428,6 +469,72 @@ export async function upsertMonitoredTenants(
     count: tenantsList.length,
     firestoreSuccess,
     firestoreError: lastFsErrorMsg || undefined,
+  };
+}
+
+/**
+ * 3. saveIncidentFeedback(entidadeId, canal, tipo, observacao, silenciadoAte, csUser?)
+ * Salva a nota e status de snooze do CS para um par ${canal}_${tipo} no Firestore (monitored_tenants).
+ */
+export async function saveIncidentFeedback(
+  entidadeId: string,
+  canal: string,
+  tipo: string,
+  observacao: string,
+  silenciadoAte?: string | null,
+  csUser?: CSUserFilter
+): Promise<{
+  success: boolean;
+  chave: string;
+  feedback: IncidentFeedbackItem;
+}> {
+  const db = getAdminFirestore();
+  if (!db) {
+    throw new Error("Firestore indisponível (credenciais ausentes).");
+  }
+
+  const cleanCanal = (canal || "").trim();
+  const cleanTipo = (tipo || "").trim();
+  const chave = `${cleanCanal}_${cleanTipo}`;
+
+  const feedbackData: IncidentFeedbackItem = {
+    observacao: (observacao || "").trim(),
+    silenciadoAte: silenciadoAte || null,
+    atualizadoPor: csUser?.email || "cs@kenit.com.br",
+    atualizadoEm: new Date().toISOString(),
+  };
+
+  const csUid = csUser?.uid || "cs_default";
+
+  // Identifica o doc no Firestore priorizando ${csUid}_${entidadeId}
+  let targetDocRef = db.collection("monitored_tenants").doc(`${csUid}_${entidadeId}`);
+  const docSnap = await targetDocRef.get();
+
+  if (!docSnap.exists) {
+    const legacyDocRef = db.collection("monitored_tenants").doc(entidadeId);
+    const legacySnap = await legacyDocRef.get();
+    if (legacySnap.exists) {
+      targetDocRef = legacyDocRef;
+    }
+  }
+
+  await targetDocRef.set(
+    {
+      entidadeId,
+      incidentFeedback: {
+        [chave]: feedbackData,
+      },
+      updatedAt: new Date().toISOString(),
+    },
+    { merge: true }
+  );
+
+  console.log(`💾 [Firestore] Incident feedback gravado para entidade ${entidadeId} [${chave}]:`, feedbackData);
+
+  return {
+    success: true,
+    chave,
+    feedback: feedbackData,
   };
 }
 

@@ -119,7 +119,11 @@ export async function getActiveMonitoredTenants() {
           tiposMonitorados: Array.isArray(data.thresholds?.tiposMonitorados)
             ? data.thresholds.tiposMonitorados
             : [],
+          gruposMonitoramento: Array.isArray(data.thresholds?.gruposMonitoramento)
+            ? data.thresholds.gruposMonitoramento
+            : [],
         },
+        incidentFeedback: data.incidentFeedback || {},
       });
     });
 

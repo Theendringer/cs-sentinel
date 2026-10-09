@@ -197,11 +197,13 @@ export async function runCustomerSuccessAudit(
     const diasInatividade = tenant.thresholds.diasSemAcessoAlerta || 7;
     const maxErrosPermitidos = tenant.thresholds.maxErros2h ?? 5;
     const tiposMonitorados = tenant.thresholds.tiposMonitorados || [];
+    const gruposMonitoramento = tenant.thresholds.gruposMonitoramento || [];
 
     const rawHealth = (await checkTenantHealthMetrics(
       tenant.entidadeId,
       diasInatividade,
-      tiposMonitorados
+      tiposMonitorados,
+      gruposMonitoramento
     )) as any;
 
     if (rawHealth.error) {
@@ -213,12 +215,76 @@ export async function runCustomerSuccessAudit(
     const usuariosAtivos = rawHealth.usuariosAtivosNoPeriodo ?? 0;
     const totalUsuarios = rawHealth.totalUsuariosCadastrados ?? 0;
 
+    const avaliacaoGrupos = rawHealth.avaliacaoGrupos || [];
+    const gruposViolados = avaliacaoGrupos.filter((g: any) => g.violouSLA);
+    const temViolacaoGrupo = gruposViolados.length > 0;
+
     log(
-      `   📊 Métricas: ${errosRecentes} erros nas últimas 2h (limite: ${maxErrosPermitidos}) | ${usuariosAtivos}/${totalUsuarios} usuários ativos`
+      `   📊 Métricas: ${errosRecentes} erros nas últimas 2h | ${usuariosAtivos}/${totalUsuarios} usuários ativos | Grupos: ${
+        gruposViolados.length > 0
+          ? `🚨 ${gruposViolados.length} violado(s) (${gruposViolados.map((g: any) => g.nome).join(", ")})`
+          : `✅ Todos dentro do SLA (${avaliacaoGrupos.length} ativos)`
+      }`
     );
 
-    const temRiscoErros = errosRecentes > maxErrosPermitidos;
+    const agora = Date.now();
+    const incidentFeedback = tenant.incidentFeedback || {};
+
+    // Avalia cada grupo de erros agrupados (canal + tipo) contra o incidentFeedback (Snooze)
+    const gruposErrosComStatus = (rawHealth.gruposErros || []).map((g: any) => {
+      const chave = `${g.layoutIntegracao}_${g.tipoIntegracao}`;
+      const feedback = incidentFeedback[chave];
+      const silenciadoAteMs = feedback?.silenciadoAte
+        ? new Date(feedback.silenciadoAte).getTime()
+        : 0;
+      const isSilenciado = silenciadoAteMs > agora;
+      const prazoExpirado = Boolean(feedback?.silenciadoAte && silenciadoAteMs <= agora);
+
+      let statusSnooze: "ativo" | "silenciado" | "expirado" = "ativo";
+      let historicoPrompt = "";
+
+      if (isSilenciado) {
+        statusSnooze = "silenciado";
+      } else if (prazoExpirado) {
+        statusSnooze = "expirado";
+        historicoPrompt = `Histórico anterior do CS: '${feedback.observacao}' (estava silenciado até ${new Date(
+          feedback.silenciadoAte!
+        ).toLocaleDateString("pt-BR")}). Como o prazo expirou e as falhas persistem, elabore um follow-up mais assertivo para o CS cobrar o cliente.`;
+      } else if (feedback?.observacao) {
+        historicoPrompt = `Nota do CS: '${feedback.observacao}'`;
+      }
+
+      return {
+        canal: g.layoutIntegracao,
+        tipo: g.tipoIntegracao,
+        totalErros: g.totalErros,
+        statusSnooze,
+        silenciadoAte: feedback?.silenciadoAte || null,
+        observacaoCS: feedback?.observacao || null,
+        historicoPrompt,
+        amostraMensagens: g.amostraMensagens?.slice(0, 3) || [],
+        codigosAfetados: g.codigosAfetados?.slice(0, 5) || [],
+      };
+    });
+
+    const gruposSilenciados = gruposErrosComStatus.filter((g) => g.statusSnooze === "silenciado");
+    const gruposAtivosParaAlerta = gruposErrosComStatus.filter((g) => g.statusSnooze !== "silenciado");
+
+    const temRiscoErros = temViolacaoGrupo || (avaliacaoGrupos.length === 0 && errosRecentes > maxErrosPermitidos);
     const temRiscoChurn = totalUsuarios > 0 && usuariosAtivos === 0;
+
+    // Se todos os grupos com erros estão silenciados e não há risco de churn, pula o envio do alerta
+    if (
+      temRiscoErros &&
+      gruposSilenciados.length > 0 &&
+      gruposAtivosParaAlerta.length === 0 &&
+      !temRiscoChurn
+    ) {
+      log(
+        `   ⏳ Todos os ${gruposSilenciados.length} grupo(s) de erro de "${tenant.nome}" estão silenciados (Aguardando prazo acordado). Alerta suprimido temporariamente.`
+      );
+      continue;
+    }
 
     // Cenário Saudável: erros dentro do limite e engajamento adequado
     if (!temRiscoErros && !temRiscoChurn) {
@@ -244,23 +310,32 @@ export async function runCustomerSuccessAudit(
     // Cenário de Risco Identificado: Aciona o Gemini para gerar diagnóstico prescritivo
     log(`   ⚠️ Risco detectado para "${tenant.nome}". Solicitando diagnóstico à IA...`);
 
-    const resumoErros = (rawHealth.gruposErros || []).map((g: any) => ({
-      canal: g.layoutIntegracao,
-      tipo: g.tipoIntegracao,
-      totalErros: g.totalErros,
-      amostraMensagens: g.amostraMensagens?.slice(0, 3) || [],
-      codigosAfetados: g.codigosAfetados?.slice(0, 5) || [],
-    }));
-
     const dadosAuditoria = {
       empresa: tenant.nome,
       entidadeId: tenant.entidadeId,
       csResponsavel: tenant.assignedCS,
       limiteMaxErrosTolerados: maxErrosPermitidos,
       errosDetectadosUltimas2h: errosRecentes,
+      gruposMonitoramentoAvaliados: avaliacaoGrupos,
+      gruposComSlaViolado: gruposViolados.map((g: any) => ({
+        nomeGrupo: g.nome,
+        janela: `${g.janelaValor} ${g.janelaUnidade}`,
+        limiteConfigurado: g.limiteErros,
+        errosDetectados: g.totalErros,
+        tipos: g.tipos,
+      })),
+      gruposErrosAtivos: gruposAtivosParaAlerta,
+      gruposErrosSilenciados: gruposSilenciados.map((g) => ({
+        canal: g.canal,
+        tipo: g.tipo,
+        totalErros: g.totalErros,
+        observacao: g.observacaoCS,
+        silenciadoAte: g.silenciadoAte,
+        status: "Aguardando prazo acordado",
+      })),
       totalUsuariosCadastrados: totalUsuarios,
-      usuariosAtivos7d: usuariosAtivos,
-      resumoGruposErros: resumoErros,
+      usuariosAtivosNoPeriodo: usuariosAtivos,
+      ultimoAcessoGeral: rawHealth.ultimoAcessoGeral,
       amostraGeralMensagens: (rawHealth.amostraErros || []).slice(0, 5),
     };
 
@@ -269,9 +344,16 @@ Analise os dados de telemetria e erros recentes de integração da empresa "${te
 ${JSON.stringify(dadosAuditoria, null, 2)}
 
 DIRETRIZES DE CS:
-1. Identifique o padrão recorrente nos erros e os canais de integração impactados (ex: VTEX, Mercado Livre, Shopee).
-2. Avalie o impacto comercial real para a operação do cliente.
-3. Elabore um ROTEIRO DE CONTATO PREVENTIVO pronto para o analista de CS contatar o cliente antes que o cliente abra um chamado.
+1. Avaliação de Regras por Grupos Customizados: O cliente possui grupos de monitoramento com limites e janelas independentes (ver 'gruposComSlaViolado'). Se algum grupo violou SLA, destaque enfaticamente no diagnóstico qual grupo de regras falhou (ex.: 'Operação de Pedidos', 'Catálogo e Anúncios'), o volume de erros e a janela configurada.
+2. Peso e Severidade do Grupo: Avalie a criticidade do incidente com base no peso de negócio daquele grupo violado:
+   - Grupos de Pedidos, Pagamento ou Faturamento: Urgência imediata / Risco Crítico / prioridade máxima de atuação.
+   - Grupos de Estoque, Preço ou Frete: Risco Alto / Urgência operacional alta.
+   - Grupos de Anúncios, Imagens ou Categorias: Risco Médio / Aviso de rotina e acompanhamento comercial regular.
+3. Regra de Engajamento/Saúde: A conta é considerada Ativa/Saudável se pelo menos 1 usuário tiver realizado login no período tolerado (${diasInatividade} dias). Só classifique como "RISCO DE CHURN / DESENGAJAMENTO" por inatividade se NENHUM usuário da entidade tiver logado nos últimos ${diasInatividade} dias (usuariosAtivosNoPeriodo == 0).
+4. Grupos Silenciados vs Prazos Expirados (Snooze):
+   - Grupos em 'gruposErrosSilenciados': O CS alinhou prazo futuro com o cliente ('Aguardando prazo acordado'). NÃO alerte com urgência sobre eles.
+   - Grupos ativos com 'historicoPrompt' de prazo expirado: O prazo dado pelo CS ao cliente expirou e as falhas persistem! Elabore um follow-up mais assertivo e firme para o CS cobrar o cliente e exigir resolução da pendência.
+5. Elabore um ROTEIRO DE CONTATO PREVENTIVO pronto para o analista de CS contatar o cliente antes que o cliente abra um chamado.
 
 Retorne EXCLUSIVAMENTE um objeto JSON válido (sem tags markdown ou texto fora do JSON) com a estrutura:
 {
@@ -315,6 +397,8 @@ Retorne EXCLUSIVAMENTE um objeto JSON válido (sem tags markdown ou texto fora d
           : "RISCO DE CHURN / DESENGAJAMENTO",
         resumo: temRiscoErros
           ? `${errosRecentes} falhas recentes de integração detectadas nas últimas 2h para a empresa ${tenant.nome}.`
+          : rawHealth.ultimoAcessoGeral?.diasSemAcesso !== null && rawHealth.ultimoAcessoGeral?.diasSemAcesso !== undefined
+          ? `Nenhum usuário ativo identificado nos últimos ${diasInatividade} dias para a empresa ${tenant.nome}. Último login geral registrado há ${rawHealth.ultimoAcessoGeral.diasSemAcesso} dias (${rawHealth.ultimoAcessoGeral.usuarioNome || "usuário"}).`
           : `Nenhum usuário ativo identificado nos últimos ${diasInatividade} dias para a empresa ${tenant.nome}.`,
         estrategiaCS:
           "Realizar contato imediato com o ponto focal para validar a estabilidade das operações e alinhar plano de mitigação.",
