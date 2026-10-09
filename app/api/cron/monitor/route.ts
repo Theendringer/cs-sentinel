@@ -1,3 +1,7 @@
+export const maxDuration = 60;
+export const dynamic = "force-dynamic";
+
+import { NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import {
   getActiveMonitoredTenants,
@@ -7,18 +11,32 @@ import {
   MonitoredTenant,
   CSUserFilter,
 } from "@/lib/firebase-admin";
-import { checkTenantHealthMetrics } from "@/lib/mongodb";
+import { getMongoDb, ObjectId } from "@/lib/mongodb";
 import {
   sendCSMonitoringEmail,
   ClientAlertItem,
   IncidentErrorSummary,
 } from "@/lib/email";
 
-export const maxDuration = 60;
-export const dynamic = "force-dynamic";
+/**
+ * Utilitário para processar tarefas em lotes com concorrência controlada (Promise.all)
+ */
+async function processInBatches<T, R>(
+  items: T[],
+  batchSize: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map((item) => fn(item)));
+    results.push(...batchResults);
+  }
+  return results;
+}
 
 /**
- * Invoca o Gemini com retry e fallback defensivo para gerar o diagnóstico de IA
+ * Invoca o Gemini com retry, timeout defensivo e fallback imediato caso a IA demore
  */
 async function generateGeminiDiagnosis(
   dadosIncidente: {
@@ -43,12 +61,20 @@ async function generateGeminiDiagnosis(
 
   if (apiKey) {
     const genAI = new GoogleGenerativeAI(apiKey);
-    const modelsToTry = [
-      process.env.GEMINI_MODEL || "gemini-3.5-flash-lite",
-      "gemini-3.5-flash",
+    const envModel = (process.env.GEMINI_MODEL || "").trim();
+    // Filtra modelos inexistentes que geram 404 e timeouts de rede desnecessários
+    const candidateModels = [
+      envModel,
       "gemini-2.5-flash",
       "gemini-1.5-flash",
-    ];
+    ].filter(
+      (m) =>
+        Boolean(m) &&
+        m !== "gemini-3.5-flash-lite" &&
+        m !== "gemini-3.5-flash"
+    );
+    const modelsToTry =
+      candidateModels.length > 0 ? candidateModels : ["gemini-2.5-flash", "gemini-1.5-flash"];
 
     const prompt = `Você é o Sentinel IA, especialista em Customer Success Preventivo e Observabilidade da Kenit.
 Analise os dados deste incidente operacional e gere um diagnóstico de negócio estratégico e um roteiro de contato para o analista de CS:
@@ -83,7 +109,17 @@ Retorne EXCLUSIVAMENTE um JSON com as seguintes chaves (sem markdown):
           model: modelName,
           generationConfig: { responseMimeType: "application/json" },
         });
-        const res = await model.generateContent(prompt);
+
+        // Timeout defensivo de 6 segundos para não prender a execução do cron
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Timeout Gemini (6s)")), 6000)
+        );
+
+        const res = (await Promise.race([
+          model.generateContent(prompt),
+          timeoutPromise,
+        ])) as any;
+
         const text = res.response.text();
         const parsed = JSON.parse(text);
         if (parsed.diagnosticoIA && parsed.roteiroAbordagem) {
@@ -96,12 +132,12 @@ Retorne EXCLUSIVAMENTE um JSON com as seguintes chaves (sem markdown):
           };
         }
       } catch (err: any) {
-        console.warn(`[Gemini Monitor] Falha no modelo ${modelName}:`, err.message);
+        console.warn(`[Gemini Monitor] Falha/Timeout no modelo ${modelName}:`, err.message);
       }
     }
   }
 
-  // Fallback estruturado de alta qualidade caso o Gemini esteja indisponível
+  // Fallback estruturado de alta performance caso a IA esteja offline ou lenta
   const temFalhaCritica = dadosIncidente.falhasAtivas.some((f) =>
     f.tipo.toLowerCase().includes("pedido") || f.totalErros > 10
   );
@@ -120,7 +156,310 @@ Retorne EXCLUSIVAMENTE um JSON com as seguintes chaves (sem markdown):
 }
 
 /**
- * Ciclo principal de monitoramento e envio de e-mails
+ * Avalia a saúde de uma entidade individualmente com filtragem prévia rápida no MongoDB
+ */
+async function evaluateSingleTenant(
+  tenant: MonitoredTenant,
+  csGroup: { csUid?: string; csName: string; csEmail: string },
+  agora: number
+): Promise<{
+  hasIncident: boolean;
+  clientAlert?: ClientAlertItem;
+}> {
+  try {
+    const db = await getMongoDb();
+    let targetObjectId: ObjectId;
+    try {
+      targetObjectId = new ObjectId(tenant.entidadeId);
+    } catch {
+      return { hasIncident: false };
+    }
+
+    const duasHorasAtras = new Date(agora - 2 * 60 * 60 * 1000);
+    const incidentFeedback = tenant.incidentFeedback || {};
+    const limiteGeralPadrao = tenant.thresholds?.maxErros2h ?? 5;
+
+    // 1. Filtragem Prévia Rápida no Mongo:
+    // Projeção mínima (.project({ _id: 1, tipoIntegracao: 1, layoutIntegracao: 1, dataCriacao: 1 })) e limit(20)
+    // Evita transferir payloads gigantes de requisicao e retorno antes de confirmar se os limites foram violados
+    const errorQuery: any = {
+      entidade: targetObjectId,
+      status: "pendente",
+      $or: [
+        { dataCriacao: { $gte: duasHorasAtras } },
+        { ultimaAtualizacao: { $gte: duasHorasAtras } },
+        { dataCriacao: { $gte: duasHorasAtras.toISOString() } },
+        { ultimaAtualizacao: { $gte: duasHorasAtras.toISOString() } },
+      ],
+    };
+
+    const tiposMonitorados = tenant.thresholds?.tiposMonitorados || [];
+    if (Array.isArray(tiposMonitorados) && tiposMonitorados.length > 0) {
+      const regexList = tiposMonitorados.map(
+        (t) => new RegExp(`^${t.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i")
+      );
+      errorQuery.tipoIntegracao = { $in: regexList };
+    }
+
+    const fastErrosDocs = await db
+      .collection("errosintegracoes")
+      .find(errorQuery)
+      .project({ _id: 1, tipoIntegracao: 1, layoutIntegracao: 1, dataCriacao: 1 })
+      .sort({ dataCriacao: -1, ultimaAtualizacao: -1 })
+      .limit(20)
+      .toArray();
+
+    // Agrupamento rápido por layout e tipo de integração
+    const gruposPreMap = new Map<string, { canal: string; tipo: string; count: number }>();
+    for (const doc of fastErrosDocs) {
+      const canal = (doc.layoutIntegracao as string) || "Geral";
+      const tipo = (doc.tipoIntegracao as string) || "Geral";
+      const chave = `${canal}_${tipo}`;
+      const existing = gruposPreMap.get(chave) || { canal, tipo, count: 0 };
+      existing.count++;
+      gruposPreMap.set(chave, existing);
+    }
+
+    // Filtragem com Snooze
+    const falhasAtivasPre: Array<{
+      canal: string;
+      tipo: string;
+      count: number;
+      despertado: boolean;
+      feedback?: any;
+    }> = [];
+    let temSnoozeExpirado = false;
+    let observacaoSnoozeExpirado: string | null = null;
+    let totalGruposSilenciados = 0;
+
+    for (const [chave, g] of gruposPreMap.entries()) {
+      const feedback = incidentFeedback[chave];
+      const silenciadoAteMs = feedback?.silenciadoAte
+        ? new Date(feedback.silenciadoAte).getTime()
+        : 0;
+
+      // FILTRO DE SNOOZE: se silenciadoAte > agora, ignora este grupo
+      if (silenciadoAteMs > agora) {
+        totalGruposSilenciados++;
+        continue;
+      }
+
+      const despertado = Boolean(feedback?.silenciadoAte && silenciadoAteMs <= agora);
+      if (despertado) {
+        temSnoozeExpirado = true;
+        observacaoSnoozeExpirado = feedback?.observacao || null;
+      }
+
+      falhasAtivasPre.push({
+        canal: g.canal,
+        tipo: g.tipo,
+        count: g.count,
+        despertado,
+        feedback,
+      });
+    }
+
+    const totalErrosNaoSilenciados = falhasAtivasPre.reduce((acc, f) => acc + f.count, 0);
+
+    // Validação de grupos customizados de monitoramento (SLA)
+    const gruposMonitoramento = tenant.thresholds?.gruposMonitoramento || [];
+    let violouGruposSla = false;
+    const gruposVioladosInfo: any[] = [];
+
+    if (gruposMonitoramento.length > 0 && fastErrosDocs.length > 0) {
+      for (const gm of gruposMonitoramento) {
+        const gmTipos = (gm.tipos || []).map((t: string) => t.toLowerCase());
+        const countGm = fastErrosDocs.filter((d: any) =>
+          gmTipos.length === 0 || gmTipos.includes(String(d.tipoIntegracao || "").toLowerCase())
+        ).length;
+        if (countGm > (gm.limiteErros ?? 5)) {
+          violouGruposSla = true;
+          gruposVioladosInfo.push({
+            nome: gm.nome,
+            limiteErros: gm.limiteErros,
+            totalErros: countGm,
+            violouSLA: true,
+          });
+        }
+      }
+    }
+
+    const violouThresholdErros =
+      violouGruposSla ||
+      (gruposMonitoramento.length === 0 && totalErrosNaoSilenciados > limiteGeralPadrao);
+
+    // Checagem enxuta de inatividade de usuários
+    let violouEngajamento = false;
+    let diasSemAcessoGeral: number | null = null;
+    let totalUsuarios = 0;
+    let usuariosInativos = 0;
+
+    const diasInatividadeConfig = tenant.thresholds?.diasSemAcessoAlerta || 7;
+    const limiteInatividade = new Date(agora - diasInatividadeConfig * 24 * 60 * 60 * 1000);
+
+    const usuariosDocs = await db
+      .collection("usuarios")
+      .find({ entidade: targetObjectId })
+      .project({ _id: 1, ultimoAcesso: 1 })
+      .limit(50)
+      .toArray();
+
+    totalUsuarios = usuariosDocs.length;
+    if (totalUsuarios > 0) {
+      let dataMaisRecente: Date | null = null;
+      let ativosCount = 0;
+      for (const u of usuariosDocs) {
+        const dt = u.ultimoAcesso ? new Date(u.ultimoAcesso) : null;
+        if (dt && !isNaN(dt.getTime())) {
+          if (!dataMaisRecente || dt > dataMaisRecente) {
+            dataMaisRecente = dt;
+          }
+          if (dt >= limiteInatividade) {
+            ativosCount++;
+          }
+        }
+      }
+      if (dataMaisRecente) {
+        diasSemAcessoGeral = Math.max(
+          0,
+          Math.floor((agora - dataMaisRecente.getTime()) / (1000 * 60 * 60 * 24))
+        );
+      }
+      usuariosInativos = totalUsuarios - ativosCount;
+      if (ativosCount === 0 && totalUsuarios > 0) {
+        violouEngajamento = true;
+      }
+    }
+
+    // Regra determinante de incidente ativo
+    const temIncidenteAtivo =
+      (violouThresholdErros && falhasAtivasPre.length > 0) ||
+      temSnoozeExpirado ||
+      violouEngajamento;
+
+    // GATILHO DE IA APENAS EM INCIDENTES REAIS:
+    // Se saudável ou dentro da normalidade / silenciado pelo snooze, NÃO chama Gemini!
+    if (!temIncidenteAtivo) {
+      resolveTenantAlerts(
+        tenant.entidadeId,
+        "Operação restabelecida na varredura automatizada.",
+        csGroup.csUid
+      ).catch(() => {});
+      return { hasIncident: false };
+    }
+
+    console.log(
+      `🚨 [Monitor Cron] Incidente confirmado para "${tenant.nome}" (${falhasAtivasPre.length} falha(s) ativa(s), ${totalGruposSilenciados} silenciada(s)). Buscando mensagens e acionando IA...`
+    );
+
+    // Busca apenas amostra enxuta de mensagens dos erros (sem payloads pesados de retorno)
+    const docIds = fastErrosDocs.slice(0, 10).map((d) => d._id);
+    const detalheDocs = await db
+      .collection("errosintegracoes")
+      .find({ _id: { $in: docIds } })
+      .project({
+        layoutIntegracao: 1,
+        tipoIntegracao: 1,
+        codigoRegistro: 1,
+        "mensagens.texto": 1,
+      })
+      .toArray();
+
+    const falhasAtivas: IncidentErrorSummary[] = falhasAtivasPre.map((f) => {
+      const docsGrupo = detalheDocs.filter(
+        (d: any) =>
+          (d.layoutIntegracao || "Geral") === f.canal &&
+          (d.tipoIntegracao || "Geral") === f.tipo
+      );
+
+      const codigosAfetados = docsGrupo
+        .map((d: any) => (d.codigoRegistro ? String(d.codigoRegistro) : null))
+        .filter(Boolean)
+        .slice(0, 5) as string[];
+
+      const amostraMensagens: string[] = [];
+      for (const d of docsGrupo) {
+        if (Array.isArray(d.mensagens)) {
+          for (const m of d.mensagens) {
+            const txt = typeof m === "string" ? m : m?.texto;
+            if (txt && amostraMensagens.length < 3) {
+              amostraMensagens.push(String(txt).trim());
+            }
+          }
+        }
+      }
+
+      return {
+        canal: f.canal,
+        tipo: f.tipo,
+        totalErros: f.count,
+        codigosAfetados,
+        amostraMensagens,
+        statusSnooze: f.despertado ? "expirado" : "ativo",
+      };
+    });
+
+    // Diagnóstico estrito com Gemini apenas para entidades com incidentes confirmados
+    const aiDiagnosis = await generateGeminiDiagnosis({
+      empresa: tenant.nome,
+      errosRecentes: fastErrosDocs.length,
+      gruposViolados: gruposVioladosInfo,
+      falhasAtivas,
+      despertadoSnooze: temSnoozeExpirado,
+      observacaoAnteriorSnooze: observacaoSnoozeExpirado,
+      diasSemAcesso: diasSemAcessoGeral,
+      usuariosInativos,
+      totalUsuarios,
+    });
+
+    const clientAlert: ClientAlertItem = {
+      entidadeId: tenant.entidadeId,
+      entidadeNome: tenant.nome,
+      nivelCriticidade: aiDiagnosis.nivelCriticidade,
+      tipoRisco: aiDiagnosis.tipoRisco,
+      canalImpactado: falhasAtivas[0]?.canal || "Integrações",
+      erros2h: fastErrosDocs.length,
+      diasSemAcesso: diasSemAcessoGeral || undefined,
+      falhasVioladas: falhasAtivas,
+      diagnosticoIA: aiDiagnosis.diagnosticoIA,
+      roteiroAbordagem: aiDiagnosis.roteiroAbordagem,
+      cockpitUrl: `${process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"}/dashboard?tenant=${tenant.entidadeId}`,
+    };
+
+    // Salva o alerta no Firestore sem bloquear o fluxo
+    saveCSAlert(
+      {
+        entidadeId: tenant.entidadeId,
+        entidadeNome: tenant.nome,
+        csUid: csGroup.csUid,
+        csEmail: csGroup.csEmail,
+        csName: csGroup.csName,
+        assignedCS: {
+          uid: csGroup.csUid,
+          name: csGroup.csName,
+          email: csGroup.csEmail,
+        },
+        tipoRisco: clientAlert.tipoRisco,
+        motivo: clientAlert.diagnosticoIA,
+        acaoRecomendada: clientAlert.roteiroAbordagem,
+        status: "ativo",
+        disparadoEm: new Date().toISOString(),
+        origem: "cron-monitor",
+      },
+      csGroup.csUid
+    ).catch((err: any) => {
+      console.error(`❌ [Monitor Cron] Erro ao gravar cs_alerts_history:`, err.message);
+    });
+
+    return { hasIncident: true, clientAlert };
+  } catch (err: any) {
+    console.error(`❌ [Monitor Cron] Erro ao avaliar ${tenant.nome}:`, err.message);
+    return { hasIncident: false };
+  }
+}
+
+/**
+ * Ciclo principal de monitoramento executado com concorrência controlada
  */
 async function executeMonitoringCycle(options: {
   csFilter?: CSUserFilter;
@@ -135,22 +474,21 @@ async function executeMonitoringCycle(options: {
     }...`
   );
 
-  // 1. Varredura das Entidades Monitoradas Ativas no Firestore
   const activeTenants = await getActiveMonitoredTenants(options.csFilter);
   console.log(`📋 [Monitor Cron] ${activeTenants.length} entidade(s) ativa(s) carregada(s).`);
 
   if (activeTenants.length === 0) {
     return {
       success: true,
-      message: "Nenhuma entidade ativa encontrada para monitoramento.",
       totalTenants: 0,
       totalIncidentes: 0,
       emailsDisparados: 0,
       durationMs: Date.now() - startTime,
+      resultsByCS: [],
     };
   }
 
-  // 2. Agrupamento das entidades pelo e-mail do CS responsável (csEmail)
+  // Agrupamento por CS responsável
   const groupedByCS = new Map<
     string,
     {
@@ -191,175 +529,26 @@ async function executeMonitoringCycle(options: {
   let totalIncidentesGlobal = 0;
   let totalEmailsDisparados = 0;
 
-  // 3. Processa cada grupo de CS
+  // Processa as carteiras de CS
   for (const [csEmail, csGroup] of Array.from(groupedByCS.entries())) {
     console.log(
       `🔍 [Monitor Cron] Avaliando carteira do CS: ${csGroup.csName} (${csEmail}) com ${csGroup.tenants.length} conta(s)...`
     );
 
-    const clientAlertsForCS: ClientAlertItem[] = [];
+    // Processamento em Paralelo Controlado: lotes de 4 entidades simultâneas
+    const evaluatedResults = await processInBatches(
+      csGroup.tenants,
+      4,
+      async (tenant) => evaluateSingleTenant(tenant, csGroup, agora)
+    );
 
-    // Avalia cada entidade atribuída a esse CS
-    for (const tenant of csGroup.tenants) {
-      const diasInatividade = tenant.thresholds.diasSemAcessoAlerta || 7;
-      const tiposMonitorados = tenant.thresholds.tiposMonitorados || [];
-      const gruposMonitoramento = tenant.thresholds.gruposMonitoramento || [];
-      const incidentFeedback = tenant.incidentFeedback || {};
-
-      // Consulta métricas no MongoDB (errosintegracoes + usuarios)
-      const rawMetrics = (await checkTenantHealthMetrics(
-        tenant.entidadeId,
-        diasInatividade,
-        tiposMonitorados,
-        gruposMonitoramento
-      )) as any;
-
-      if (rawMetrics.error) {
-        console.warn(
-          `⚠️ [Monitor Cron] Erro ao consultar MongoDB para ${tenant.nome}:`,
-          rawMetrics.error
-        );
-        continue;
-      }
-
-      const totalErros2h = rawMetrics.errosRecentesUltimas2h ?? 0;
-      const usuariosAtivos = rawMetrics.usuariosAtivosNoPeriodo ?? 0;
-      const totalUsuarios = rawMetrics.totalUsuariosCadastrados ?? 0;
-      const avaliacaoGrupos = rawMetrics.avaliacaoGrupos || [];
-
-      // Avaliação de Regras e Grupos Customizados de Monitoramento
-      const gruposComSlaViolado = avaliacaoGrupos.filter((g: any) => g.violouSLA);
-
-      // Avaliação dos grupos de erro (canal + tipo) e Filtro de Snooze
-      const falhasAtivas: IncidentErrorSummary[] = [];
-      let temSnoozeExpirado = false;
-      let observacaoSnoozeExpirado: string | null = null;
-      let totalGruposSilenciados = 0;
-
-      for (const grupoErro of rawMetrics.gruposErros || []) {
-        const canal = grupoErro.layoutIntegracao || "Geral";
-        const tipo = grupoErro.tipoIntegracao || "Geral";
-        const grupoKey = `${canal}_${tipo}`;
-        const feedback = incidentFeedback[grupoKey];
-
-        const silenciadoAteMs = feedback?.silenciadoAte
-          ? new Date(feedback.silenciadoAte).getTime()
-          : 0;
-
-        // FILTRO DE SNOOZE: Se silenciadoAte > agora, ignora este grupo
-        if (silenciadoAteMs > agora) {
-          totalGruposSilenciados++;
-          continue;
-        }
-
-        // Verifica se despertou do snooze (prazo expirou e o erro persiste)
-        const despertado = Boolean(feedback?.silenciadoAte && silenciadoAteMs <= agora);
-        if (despertado) {
-          temSnoozeExpirado = true;
-          observacaoSnoozeExpirado = feedback?.observacao || null;
-        }
-
-        falhasAtivas.push({
-          canal,
-          tipo,
-          totalErros: grupoErro.totalErros,
-          amostraMensagens: grupoErro.amostraMensagens?.slice(0, 3) || [],
-          codigosAfetados: grupoErro.codigosAfetados?.slice(0, 5) || [],
-          statusSnooze: despertado ? "expirado" : "ativo",
-        });
-      }
-
-      // Verificação de Limites Ultrapassados
-      const limiteGeralPadrao = tenant.thresholds.maxErros2h ?? 5;
-      const violouErros =
-        gruposComSlaViolado.length > 0 ||
-        (avaliacaoGrupos.length === 0 && totalErros2h > limiteGeralPadrao);
-
-      const violouEngajamento = totalUsuarios > 0 && usuariosAtivos === 0;
-
-      // Se houver falhas ativas não silenciadas e violou limites, OU despertou do snooze, OU violou engajamento
-      const temIncidenteAtivo =
-        (violouErros && falhasAtivas.length > 0) ||
-        temSnoozeExpirado ||
-        violouEngajamento;
-
-      if (!temIncidenteAtivo) {
-        // Se a conta está saudável, resolve alertas anteriores
-        try {
-          await resolveTenantAlerts(
-            tenant.entidadeId,
-            "Operação restabelecida na varredura automatizada.",
-            csGroup.csUid
-          );
-        } catch {}
-        continue;
-      }
-
-      console.log(
-        `🚨 [Monitor Cron] Incidente violado para "${tenant.nome}" (${falhasAtivas.length} falhas ativas, ${totalGruposSilenciados} silenciadas). Gerando IA...`
-      );
-
-      // 4. Geração do Diagnóstico com IA (Gemini)
-      const aiDiagnosis = await generateGeminiDiagnosis({
-        empresa: tenant.nome,
-        errosRecentes: totalErros2h,
-        gruposViolados: gruposComSlaViolado,
-        falhasAtivas,
-        despertadoSnooze: temSnoozeExpirado,
-        observacaoAnteriorSnooze: observacaoSnoozeExpirado,
-        diasSemAcesso: rawMetrics.ultimoAcessoGeral?.diasSemAcesso,
-        usuariosInativos: rawMetrics.totalUsuariosInativos,
-        totalUsuarios,
-      });
-
-      const clientAlert: ClientAlertItem = {
-        entidadeId: tenant.entidadeId,
-        entidadeNome: tenant.nome,
-        nivelCriticidade: aiDiagnosis.nivelCriticidade,
-        tipoRisco: aiDiagnosis.tipoRisco,
-        canalImpactado: falhasAtivas[0]?.canal || "Integrações",
-        erros2h: totalErros2h,
-        diasSemAcesso: rawMetrics.ultimoAcessoGeral?.diasSemAcesso || undefined,
-        falhasVioladas: falhasAtivas,
-        diagnosticoIA: aiDiagnosis.diagnosticoIA,
-        roteiroAbordagem: aiDiagnosis.roteiroAbordagem,
-        cockpitUrl: `${process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"}/dashboard?tenant=${tenant.entidadeId}`,
-      };
-
-      clientAlertsForCS.push(clientAlert);
-
-      // Gravação no Firestore em cs_alerts_history com chave determinística (evitando duplicatas)
-      try {
-        await saveCSAlert(
-          {
-            entidadeId: tenant.entidadeId,
-            entidadeNome: tenant.nome,
-            csUid: csGroup.csUid,
-            csEmail,
-            csName: csGroup.csName,
-            assignedCS: {
-              uid: csGroup.csUid,
-              name: csGroup.csName,
-              email: csEmail,
-            },
-            tipoRisco: clientAlert.tipoRisco,
-            motivo: clientAlert.diagnosticoIA,
-            acaoRecomendada: clientAlert.roteiroAbordagem,
-            status: "ativo",
-            disparadoEm: new Date().toISOString(),
-            origem: "cron-monitor",
-          },
-          csGroup.csUid
-        );
-      } catch (err: any) {
-        console.error(`❌ [Monitor Cron] Erro ao gravar cs_alerts_history:`, err.message);
-      }
-    }
+    const clientAlertsForCS = evaluatedResults
+      .filter((r) => r.hasIncident && r.clientAlert)
+      .map((r) => r.clientAlert as ClientAlertItem);
 
     totalIncidentesGlobal += clientAlertsForCS.length;
 
-    // 5. Disparo do E-mail Consolidado para o CS
-    // No modo agendado, dispara e-mail se houver incidentes. No modo manual, dispara sempre para validar entrega.
+    // Disparo de E-mail consolidado para o CS
     if (clientAlertsForCS.length > 0 || options.isManualTest) {
       try {
         const mailResult = await sendCSMonitoringEmail({
@@ -410,21 +599,20 @@ async function executeMonitoringCycle(options: {
 
   return {
     success: true,
-    message: `Monitoramento ativo executado com sucesso. ${totalIncidentesGlobal} incidente(s) identificado(s).`,
-    executedAt: new Date().toISOString(),
-    durationMs,
     totalTenants: activeTenants.length,
     totalIncidentes: totalIncidentesGlobal,
     emailsDisparados: totalEmailsDisparados,
+    durationMs,
     resultsByCS,
   };
 }
 
 /**
  * Handler unificado para execução do ciclo de monitoramento ativo
- * Suporta chamadas automatizadas do cron-job.org e requisições manuais do dashboard
  */
 async function handleMonitoring(req: Request): Promise<Response> {
+  const inicio = Date.now();
+
   try {
     const authHeader = req.headers.get("authorization") || req.headers.get("Authorization");
     const cronSecret = process.env.CRON_SECRET?.trim();
@@ -448,12 +636,8 @@ async function handleMonitoring(req: Request): Promise<Response> {
     // 3. Fallback permissivo apenas em ambiente local sem secret configurado
     const isDevFallback = !cronSecret && process.env.NODE_ENV !== "production";
 
-    // Se houver CRON_SECRET e a requisição não vier autenticada nem como cron nem como CS logado
     if (!isCronAuthorized && !isCsAuthorized && !isDevFallback) {
-      return new Response(JSON.stringify({ error: "Não autorizado" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
+      return NextResponse.json({ error: "Não autorizado" }, { status: 401 });
     }
 
     const url = new URL(req.url);
@@ -467,21 +651,27 @@ async function handleMonitoring(req: Request): Promise<Response> {
       isManualTest,
     });
 
-    return new Response(JSON.stringify(result), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+    // Retorno Imediato com Resumo Enxuto conforme especificação
+    return NextResponse.json({
+      success: true,
+      entidadesVerificadas: result.totalTenants,
+      alertasEnviados: result.emailsDisparados,
+      tempoExecucaoMs: Date.now() - inicio,
+      // Metadados adicionais para manter compatibilidade com o modal de teste do dashboard
+      totalTenants: result.totalTenants,
+      totalIncidentes: result.totalIncidentes,
+      emailsDisparados: result.emailsDisparados,
+      resultsByCS: result.resultsByCS,
     });
   } catch (error: any) {
     console.error("❌ [/api/cron/monitor] Falha na execução:", error.message);
-    return new Response(
-      JSON.stringify({
+    return NextResponse.json(
+      {
         success: false,
         error: error.message || "Erro interno no processamento do monitoramento.",
-      }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      }
+        tempoExecucaoMs: Date.now() - inicio,
+      },
+      { status: 500 }
     );
   }
 }

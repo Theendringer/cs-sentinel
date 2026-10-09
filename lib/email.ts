@@ -81,6 +81,9 @@ export function createEmailTransporter() {
       user,
       pass,
     },
+    connectionTimeout: 5000, // 5s
+    greetingTimeout: 5000,
+    socketTimeout: 10000,
   });
 }
 

@@ -140,11 +140,14 @@ export async function checkTenantHealthMetrics(
     const duasHorasAtras = new Date(agora - 2 * 60 * 60 * 1000);
 
     // 1. Busca nome da entidade para conferência humana
-    const entidadeDoc = await db.collection("entidades").findOne({ _id: targetObjectId });
+    const entidadeDoc = await db.collection("entidades").findOne({ _id: targetObjectId }, { projection: { nome: 1 } });
     const nomeEntidade = entidadeDoc ? String(entidadeDoc.nome) : "Entidade Desconhecida";
 
-    // 2. Consulta Usuários no MongoDB (collection: usuarios)
-    const usuarios = await db.collection("usuarios").find({ entidade: targetObjectId }).toArray();
+    // 2. Consulta Usuários no MongoDB com projeção mínima (collection: usuarios)
+    const usuarios = await db
+      .collection("usuarios")
+      .find({ entidade: targetObjectId }, { projection: { nome: 1, email: 1, ultimoAcesso: 1 } })
+      .toArray();
     const totalUsuarios = usuarios.length;
 
     const ativos: any[] = [];
@@ -226,14 +229,13 @@ export async function checkTenantHealthMetrics(
       errorQuery.tipoIntegracao = { $in: regexList };
     }
 
-    // Projeta apenas os campos essenciais: layoutIntegracao, tipoIntegracao, codigoRegistro, mensagens.texto, requisicao.retorno.data
+    // Projeta apenas campos essenciais sem payloads gigantes de requisição e retorno
     const projection = {
+      _id: 1,
       layoutIntegracao: 1,
       tipoIntegracao: 1,
       codigoRegistro: 1,
       "mensagens.texto": 1,
-      "mensagens.tipo": 1,
-      "requisicao.retorno.data": 1,
       dataCriacao: 1,
       ultimaAtualizacao: 1,
     };
@@ -242,7 +244,7 @@ export async function checkTenantHealthMetrics(
       .collection("errosintegracoes")
       .find(errorQuery, { projection })
       .sort({ dataCriacao: -1, ultimaAtualizacao: -1 })
-      .limit(50)
+      .limit(20)
       .toArray();
 
     let totalErros2h = errosDocs.length;
@@ -389,7 +391,7 @@ export async function checkTenantHealthMetrics(
         .collection("errosintegracoes")
         .find(gQuery, { projection })
         .sort({ dataCriacao: -1, ultimaAtualizacao: -1 })
-        .limit(100)
+        .limit(20)
         .toArray();
 
       const totalErrosG = docsDoGrupo.length;
